@@ -737,6 +737,9 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
         while True:
             print("Commands:")
             print("  [e]nable   - Enable crop for files with detected crop")
+            if files_without_crop:
+                print(f"  [a]ll      - Apply detected crop to ALL {len(processable)} files")
+            print("  [o]verride - Set manual crop value for all files")
             print("  [d]isable  - Disable crop (keep black bars)")
             print("  [q]uit     - Exit")
             print()
@@ -754,6 +757,24 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                     rf.enable_crop = True
                 print(f"Crop enabled for {len(files_with_crop)} files.")
                 return True
+            elif cmd == 'a' and files_without_crop:
+                for rf in processable:
+                    rf.detected_crop = crop_value
+                    rf.enable_crop = True
+                print(f"Crop {crop_value} applied to all {len(processable)} files.")
+                return True
+            elif cmd == 'o':
+                manual_crop = input("Enter crop value (W:H:X:Y): ").strip()
+                if not manual_crop or manual_crop.count(":") != 3:
+                    print("Invalid format. Expected W:H:X:Y (e.g., 1440:1080:240:0)")
+                    continue
+                confirm = input(f"Apply {manual_crop} to all {len(processable)} files? [y/N]: ").strip().lower()
+                if confirm == 'y':
+                    for rf in processable:
+                        rf.detected_crop = manual_crop
+                        rf.enable_crop = True
+                    print(f"Crop {manual_crop} applied to all {len(processable)} files.")
+                    return True
             elif cmd == 'd':
                 for rf in files:
                     rf.enable_crop = False
@@ -788,6 +809,8 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
         while True:
             print("Commands:")
             print(f"  [m]ajority - Enable crop using majority value ({len(majority_files)} files)")
+            print(f"  [a]ll      - Apply majority crop to ALL {len(processable)} files")
+            print("  [o]verride - Set manual crop value for all files")
             print("  [d]isable  - Disable crop for all files")
             print("  [e]xclude  - Exclude files with non-majority crop from selection")
             print("  [q]uit     - Exit")
@@ -806,6 +829,24 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                     rf.enable_crop = True
                 print(f"Crop enabled for {len(majority_files)} files with majority crop value.")
                 return True
+            elif cmd == 'a':
+                for rf in processable:
+                    rf.detected_crop = majority_crop
+                    rf.enable_crop = True
+                print(f"Crop {majority_crop} applied to all {len(processable)} files.")
+                return True
+            elif cmd == 'o':
+                manual_crop = input("Enter crop value (W:H:X:Y): ").strip()
+                if not manual_crop or manual_crop.count(":") != 3:
+                    print("Invalid format. Expected W:H:X:Y (e.g., 1440:1080:240:0)")
+                    continue
+                confirm = input(f"Apply {manual_crop} to all {len(processable)} files? [y/N]: ").strip().lower()
+                if confirm == 'y':
+                    for rf in processable:
+                        rf.detected_crop = manual_crop
+                        rf.enable_crop = True
+                    print(f"Crop {manual_crop} applied to all {len(processable)} files.")
+                    return True
             elif cmd == 'd':
                 for rf in files:
                     rf.enable_crop = False
