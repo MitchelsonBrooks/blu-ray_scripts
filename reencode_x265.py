@@ -80,6 +80,58 @@ class AudioTrack:
 
 
 @dataclass
+class SubtitleTrack:
+    """Represents a single subtitle track in a file."""
+    index: int
+    language: str
+    codec: str
+    title: str
+    is_forced: bool
+    is_hearing_impaired: bool
+    is_default: bool = False
+    
+    @property
+    def codec_display(self) -> str:
+        """Human-readable codec name."""
+        codec_names = {
+            "subrip": "SRT",
+            "srt": "SRT",
+            "ass": "ASS",
+            "ssa": "SSA",
+            "hdmv_pgs_subtitle": "PGS",
+            "pgssub": "PGS",
+            "dvd_subtitle": "VobSub",
+            "dvdsub": "VobSub",
+            "mov_text": "TX3G",
+            "webvtt": "WebVTT",
+        }
+        return codec_names.get(self.codec.lower(), self.codec.upper())
+    
+    @property
+    def signature(self) -> tuple:
+        """Signature for comparing track layouts across files."""
+        return (self.language, self.codec, self.is_forced, self.is_hearing_impaired)
+    
+    @property
+    def flags(self) -> list[str]:
+        """List of flag strings for display."""
+        f = []
+        if self.is_forced:
+            f.append("forced")
+        if self.is_hearing_impaired:
+            f.append("SDH")
+        return f
+    
+    def __str__(self) -> str:
+        parts = [f"{self.language.upper()} ({self.codec_display})"]
+        if self.title:
+            parts.append(f'"{self.title}"')
+        if self.flags:
+            parts.append(f"[{', '.join(self.flags)}]")
+        return " ".join(parts)
+
+
+@dataclass
 class ReencodeFile:
     """Represents an MKV file to be re-encoded."""
     path: Path
@@ -87,15 +139,28 @@ class ReencodeFile:
     is_hdr: bool
     is_dv: bool
     audio_tracks: list[AudioTrack]
+    subtitle_tracks: list[SubtitleTrack]
     x265_params: list[str]
     size_gb: float
     selected: bool = True
     skip_reason: str = ""
+    default_audio_lang: str = ""      # Language code for default audio
+    default_subtitle_lang: str = ""   # Language code for default subtitle ("" = none)
     
     @property
     def audio_signature(self) -> tuple:
         """Signature of all audio tracks for comparison."""
         return tuple(t.signature for t in self.audio_tracks)
+    
+    @property
+    def subtitle_signature(self) -> tuple:
+        """Signature of all subtitle tracks for comparison."""
+        return tuple(t.signature for t in self.subtitle_tracks)
+    
+    @property
+    def selected_audio_tracks(self) -> list[AudioTrack]:
+        """List of selected audio tracks."""
+        return [t for t in self.audio_tracks if t.selected]
     
     @property
     def selected_audio_indices(self) -> list[int]:
@@ -110,6 +175,27 @@ class ReencodeFile:
         elif self.is_hdr:
             return "HDR"
         return "SDR"
+    
+    def get_default_audio_index(self) -> int | None:
+        """Get the output stream index for default audio track."""
+        selected = self.selected_audio_tracks
+        if not selected:
+            return None
+        if not self.default_audio_lang:
+            return 0  # First selected track
+        for i, track in enumerate(selected):
+            if track.language == self.default_audio_lang:
+                return i
+        return 0  # Fallback to first
+    
+    def get_default_subtitle_index(self) -> int | None:
+        """Get the output stream index for default subtitle track."""
+        if not self.default_subtitle_lang or not self.subtitle_tracks:
+            return None
+        for i, track in enumerate(self.subtitle_tracks):
+            if track.language == self.default_subtitle_lang:
+                return i
+        return None
 
 
 def log(message: str):
@@ -182,6 +268,39 @@ def get_audio_tracks(source: Path) -> list[AudioTrack]:
             profile=profile,
             is_lossless=is_lossless,
             is_lossy=is_lossy
+        )
+        tracks.append(track)
+    
+    return tracks
+
+
+def get_subtitle_tracks(source: Path) -> list[SubtitleTrack]:
+    """Get all subtitle track info as SubtitleTrack objects."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "s",
+        "-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired",
+        "-of", "json",
+        str(source)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+    except Exception:
+        return []
+    
+    tracks = []
+    for stream in streams:
+        disposition = stream.get("disposition", {})
+        
+        track = SubtitleTrack(
+            index=stream.get("index", 0),
+            language=stream.get("tags", {}).get("language", "und"),
+            codec=stream.get("codec_name", "unknown"),
+            title=stream.get("tags", {}).get("title", ""),
+            is_forced=disposition.get("forced", 0) == 1,
+            is_hearing_impaired=disposition.get("hearing_impaired", 0) == 1,
         )
         tracks.append(track)
     
@@ -337,6 +456,9 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         # Get audio tracks
         audio_tracks = get_audio_tracks(mkv_path)
         
+        # Get subtitle tracks
+        subtitle_tracks = get_subtitle_tracks(mkv_path)
+        
         # File size
         size_gb = mkv_path.stat().st_size / (1024**3)
         
@@ -346,6 +468,7 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
             is_hdr=is_hdr,
             is_dv=dv,
             audio_tracks=audio_tracks,
+            subtitle_tracks=subtitle_tracks,
             x265_params=x265_params,
             size_gb=size_gb,
             selected=not dv,  # Auto-deselect DV files
@@ -545,6 +668,139 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
 
 
 # =============================================================================
+# Phase 2b: Default Track Configuration
+# =============================================================================
+
+def configure_defaults(files: list[ReencodeFile]) -> bool:
+    """
+    Configure default audio and subtitle tracks.
+    Returns True to continue, False to quit.
+    """
+    processable = [f for f in files if not f.is_dv and f.selected]
+    
+    if not processable:
+        return True
+    
+    # Use first file as reference for display
+    ref_file = processable[0]
+    selected_audio = ref_file.selected_audio_tracks
+    subtitle_tracks = ref_file.subtitle_tracks
+    
+    # Check if subtitle layouts are consistent
+    sub_signatures = {}
+    for rf in processable:
+        sig = rf.subtitle_signature
+        if sig not in sub_signatures:
+            sub_signatures[sig] = []
+        sub_signatures[sig].append(rf)
+    
+    subtitles_consistent = len(sub_signatures) == 1
+    
+    # Initialize defaults: first audio track, no subtitle default
+    default_audio_idx = 0
+    default_subtitle_idx = None  # None means no default
+    
+    print()
+    print("=" * 60)
+    print("Default Track Configuration")
+    print("=" * 60)
+    
+    while True:
+        print()
+        print("Selected audio tracks:")
+        for i, track in enumerate(selected_audio):
+            marker = " *" if i == default_audio_idx else ""
+            print(f"  {i+1}. {track}{marker}")
+        
+        if default_audio_idx is not None and default_audio_idx < len(selected_audio):
+            audio_lang = selected_audio[default_audio_idx].language
+            print(f"\n  Default audio: Track {default_audio_idx + 1} ({audio_lang.upper()})")
+        
+        print()
+        
+        if not subtitle_tracks:
+            print("Subtitle tracks: None")
+        else:
+            print("Subtitle tracks:")
+            if not subtitles_consistent:
+                print("  [!] Warning: Subtitle layouts differ across files")
+                print(f"      ({len(sub_signatures)} different layouts detected)")
+                print("      Default will apply by language where available")
+                print()
+            
+            for i, track in enumerate(subtitle_tracks):
+                marker = " *" if i == default_subtitle_idx else ""
+                print(f"  {i+1}. {track}{marker}")
+            
+            if default_subtitle_idx is not None:
+                sub_lang = subtitle_tracks[default_subtitle_idx].language
+                print(f"\n  Default subtitle: Track {default_subtitle_idx + 1} ({sub_lang.upper()})")
+            else:
+                print(f"\n  Default subtitle: None")
+        
+        print()
+        print("Commands:")
+        print("  a <num>       - Set default audio (e.g., 'a 1')")
+        if subtitle_tracks:
+            print("  s <num|none>  - Set default subtitle (e.g., 's 1' or 's none')")
+        print("  [c]ontinue    - Accept and continue")
+        print("  [q]uit        - Exit without processing")
+        print()
+        
+        try:
+            cmd = input("defaults> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        
+        if cmd == 'q':
+            return False
+        elif cmd == 'c':
+            # Apply defaults to all files
+            if default_audio_idx is not None and default_audio_idx < len(selected_audio):
+                audio_lang = selected_audio[default_audio_idx].language
+                for rf in files:
+                    rf.default_audio_lang = audio_lang
+            
+            if default_subtitle_idx is not None and default_subtitle_idx < len(subtitle_tracks):
+                sub_lang = subtitle_tracks[default_subtitle_idx].language
+                for rf in files:
+                    rf.default_subtitle_lang = sub_lang
+            else:
+                for rf in files:
+                    rf.default_subtitle_lang = ""
+            
+            return True
+        elif cmd.startswith('a '):
+            try:
+                idx = int(cmd[2:].strip()) - 1
+                if 0 <= idx < len(selected_audio):
+                    default_audio_idx = idx
+                else:
+                    print(f"Invalid track number. Enter 1-{len(selected_audio)}")
+            except ValueError:
+                print("Invalid input. Use 'a <number>'")
+        elif cmd.startswith('s '):
+            if not subtitle_tracks:
+                print("No subtitle tracks available")
+                continue
+            arg = cmd[2:].strip()
+            if arg == 'none':
+                default_subtitle_idx = None
+            else:
+                try:
+                    idx = int(arg) - 1
+                    if 0 <= idx < len(subtitle_tracks):
+                        default_subtitle_idx = idx
+                    else:
+                        print(f"Invalid track number. Enter 1-{len(subtitle_tracks)} or 'none'")
+                except ValueError:
+                    print("Invalid input. Use 's <number>' or 's none'")
+        else:
+            print("Unknown command")
+
+
+# =============================================================================
 # Phase 3: File Selection
 # =============================================================================
 
@@ -664,7 +920,13 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
 # Phase 4: Encoding
 # =============================================================================
 
-def encode_file(source: Path, x265_params: list[str], audio_indices: list[int]) -> bool:
+def encode_file(
+    source: Path,
+    x265_params: list[str],
+    audio_indices: list[int],
+    default_audio_idx: int | None = 0,
+    default_subtitle_idx: int | None = None
+) -> bool:
     """Encode a single file. Returns True on success."""
     temp_output = source.with_suffix(".tmp.mkv")
 
@@ -699,7 +961,25 @@ def encode_file(source: Path, x265_params: list[str], audio_indices: list[int]) 
         "-c:s", "copy",
         "-c:t", "copy",
         "-c:d", "copy",
-        "-disposition:s", "0",
+    ])
+    
+    # Set audio track dispositions
+    for i in range(len(audio_indices)):
+        if i == default_audio_idx:
+            cmd.extend([f"-disposition:a:{i}", "default"])
+        else:
+            cmd.extend([f"-disposition:a:{i}", "0"])
+    
+    # Set subtitle track dispositions
+    if default_subtitle_idx is not None:
+        # Clear all first, then set the default
+        cmd.extend(["-disposition:s", "0"])
+        cmd.extend([f"-disposition:s:{default_subtitle_idx}", "default"])
+    else:
+        # Clear all subtitle defaults
+        cmd.extend(["-disposition:s", "0"])
+    
+    cmd.extend([
         "-y",
         str(temp_output)
     ])
@@ -746,15 +1026,18 @@ def process_file(rf: ReencodeFile) -> str:
     archive_path = get_archive_path(source)
 
     audio_indices = rf.selected_audio_indices
+    default_audio_idx = rf.get_default_audio_index()
+    default_subtitle_idx = rf.get_default_subtitle_index()
     
     log(f"Processing: {source.name} (codec: {rf.codec}, {rf.hdr_status})")
-    log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_indices)} selected")
+    log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_indices)} selected (default: {default_audio_idx})")
+    log(f"  Subtitles: {len(rf.subtitle_tracks)} tracks (default: {default_subtitle_idx})")
     
     if rf.x265_params:
         log(f"  HDR params: {':'.join(rf.x265_params)}")
 
     # Encode
-    if not encode_file(source, rf.x265_params, audio_indices):
+    if not encode_file(source, rf.x265_params, audio_indices, default_audio_idx, default_subtitle_idx):
         return "failed"
 
     # Create archive directory
@@ -874,6 +1157,11 @@ def main():
 
     # Phase 2: Audio configuration
     if not configure_audio(files):
+        print("Cancelled.")
+        sys.exit(0)
+
+    # Phase 2b: Default track configuration
+    if not configure_defaults(files):
         print("Cancelled.")
         sys.exit(0)
 
