@@ -142,6 +142,9 @@ class ReencodeFile:
     subtitle_tracks: list[SubtitleTrack]
     x265_params: list[str]
     size_gb: float
+    duration_seconds: float = 0.0
+    detected_crop: str = ""           # Detected crop string (e.g., "1920:800:0:140")
+    enable_crop: bool = False         # Whether to apply crop during encode
     selected: bool = True
     skip_reason: str = ""
     default_audio_lang: str = ""      # Language code for default audio
@@ -175,6 +178,17 @@ class ReencodeFile:
         elif self.is_hdr:
             return "HDR"
         return "SDR"
+    
+    @property
+    def crop_dimensions(self) -> tuple[int, int, int, int] | None:
+        """Parse crop string into (w, h, x, y) tuple."""
+        if not self.detected_crop:
+            return None
+        try:
+            parts = self.detected_crop.split(":")
+            return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+        except (ValueError, IndexError):
+            return None
     
     def get_default_audio_index(self) -> int | None:
         """Get the output stream index for default audio track."""
@@ -307,6 +321,103 @@ def get_subtitle_tracks(source: Path) -> list[SubtitleTrack]:
     return tracks
 
 
+def get_duration(source: Path) -> float:
+    """Get video duration in seconds."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(source)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        return float(data.get("format", {}).get("duration", 0))
+    except Exception:
+        return 0.0
+
+
+def detect_crop(source: Path, duration: float, num_samples: int = 8) -> str:
+    """
+    Detect crop values by sampling multiple points in the video.
+    Returns crop string like "1920:800:0:140" or empty string if no crop needed.
+    """
+    if duration <= 0:
+        return ""
+    
+    # Generate sample points, avoiding first/last 5% of video
+    start_pct = 0.05
+    end_pct = 0.95
+    sample_points = []
+    for i in range(num_samples):
+        pct = start_pct + (end_pct - start_pct) * i / (num_samples - 1)
+        sample_points.append(duration * pct)
+    
+    crop_values = []
+    
+    for seek_time in sample_points:
+        cmd = [
+            "ffmpeg",
+            "-ss", str(seek_time),
+            "-i", str(source),
+            "-vf", "cropdetect=round=2:limit=24",
+            "-frames:v", "3",
+            "-f", "null",
+            "-"
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # Parse cropdetect output from stderr
+            for line in result.stderr.split('\n'):
+                if "crop=" in line:
+                    # Extract crop value: crop=1920:800:0:140
+                    match = line.split("crop=")[-1].split()[0]
+                    if match and ":" in match:
+                        crop_values.append(match)
+        except (subprocess.TimeoutExpired, Exception):
+            continue
+    
+    if not crop_values:
+        return ""
+    
+    # Find most common crop value
+    from collections import Counter
+    crop_counter = Counter(crop_values)
+    most_common_crop, count = crop_counter.most_common(1)[0]
+    
+    # Parse the crop to check if it's meaningful
+    try:
+        parts = most_common_crop.split(":")
+        w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        
+        # Get original resolution to compare
+        stream = probe_video(source)
+        # Try to get resolution from a separate probe
+        res_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(source)
+        ]
+        res_result = subprocess.run(res_cmd, capture_output=True, text=True)
+        res_data = json.loads(res_result.stdout)
+        res_stream = res_data.get("streams", [{}])[0]
+        orig_w = res_stream.get("width", w)
+        orig_h = res_stream.get("height", h)
+        
+        # Only report crop if it removes at least 20 pixels on any edge
+        # and the result is at least 90% of samples agree
+        if (x > 10 or y > 10 or (orig_w - w - x) > 10 or (orig_h - h - y) > 10):
+            if count >= len(crop_values) * 0.7:  # 70% agreement
+                return most_common_crop
+    except (ValueError, IndexError):
+        pass
+    
+    return ""
+
+
 def is_dolby_vision(source: Path) -> bool:
     """Detect Dolby Vision content."""
     cmd = [
@@ -437,11 +548,12 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         return []
     
     print(f"Scanning {len(mkv_paths)} MKV files...")
+    print("  (includes crop detection - this may take a moment per file)")
     print()
     
     files = []
     for i, mkv_path in enumerate(mkv_paths, 1):
-        print(f"\r  Analyzing [{i}/{len(mkv_paths)}] {mkv_path.name[:50]}...", end="", flush=True)
+        print(f"\r  [{i}/{len(mkv_paths)}] {mkv_path.name[:50]:<50}", end="", flush=True)
         
         # Get video info
         stream = probe_video(mkv_path)
@@ -459,6 +571,12 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         # Get subtitle tracks
         subtitle_tracks = get_subtitle_tracks(mkv_path)
         
+        # Get duration
+        duration = get_duration(mkv_path)
+        
+        # Detect crop
+        detected_crop = detect_crop(mkv_path, duration)
+        
         # File size
         size_gb = mkv_path.stat().st_size / (1024**3)
         
@@ -471,6 +589,8 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
             subtitle_tracks=subtitle_tracks,
             x265_params=x265_params,
             size_gb=size_gb,
+            duration_seconds=duration,
+            detected_crop=detected_crop,
             selected=not dv,  # Auto-deselect DV files
             skip_reason="Dolby Vision" if dv else ""
         )
@@ -480,6 +600,205 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
     print(f"Scanned {len(files)} files.")
     
     return files
+
+
+# =============================================================================
+# Phase 1b: Crop Configuration
+# =============================================================================
+
+def format_crop_info(crop_str: str, source_path: Path = None) -> str:
+    """Format crop string with aspect ratio info."""
+    if not crop_str:
+        return "None"
+    
+    try:
+        parts = crop_str.split(":")
+        w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        
+        # Calculate aspect ratio
+        from math import gcd
+        divisor = gcd(w, h)
+        ar_w, ar_h = w // divisor, h // divisor
+        ar_decimal = w / h
+        
+        # Common aspect ratio names
+        ar_name = ""
+        if abs(ar_decimal - 2.40) < 0.05:
+            ar_name = "2.40:1 Scope"
+        elif abs(ar_decimal - 2.35) < 0.05:
+            ar_name = "2.35:1 Scope"
+        elif abs(ar_decimal - 1.85) < 0.05:
+            ar_name = "1.85:1"
+        elif abs(ar_decimal - 1.78) < 0.05:
+            ar_name = "16:9"
+        elif abs(ar_decimal - 1.33) < 0.05:
+            ar_name = "4:3"
+        elif abs(ar_decimal - 2.0) < 0.05:
+            ar_name = "2:1"
+        else:
+            ar_name = f"{ar_decimal:.2f}:1"
+        
+        return f"{crop_str} -> {w}x{h} ({ar_name})"
+    except (ValueError, IndexError):
+        return crop_str
+
+
+def configure_crop(files: list[ReencodeFile]) -> bool:
+    """
+    Configure crop settings based on detected values.
+    Returns True to continue, False to quit.
+    """
+    processable = [f for f in files if not f.is_dv]
+    
+    # Find files with detected crops
+    files_with_crop = [f for f in processable if f.detected_crop]
+    
+    if not files_with_crop:
+        # No crop detected on any file, skip this phase
+        return True
+    
+    # Group by crop value
+    from collections import defaultdict
+    crop_groups: dict[str, list[ReencodeFile]] = defaultdict(list)
+    for rf in files_with_crop:
+        crop_groups[rf.detected_crop].append(rf)
+    
+    print()
+    print("=" * 60)
+    print("Crop Detection Results")
+    print("=" * 60)
+    print()
+    
+    # Get original resolution from first file for context
+    first_file = files_with_crop[0]
+    res_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        str(first_file.path)
+    ]
+    try:
+        res_result = subprocess.run(res_cmd, capture_output=True, text=True)
+        res_data = json.loads(res_result.stdout)
+        res_stream = res_data.get("streams", [{}])[0]
+        orig_w = res_stream.get("width", 0)
+        orig_h = res_stream.get("height", 0)
+        print(f"Original resolution: {orig_w}x{orig_h}")
+        print()
+    except Exception:
+        pass
+    
+    files_without_crop = [f for f in processable if not f.detected_crop]
+    
+    if len(crop_groups) == 1:
+        # Consistent crop across all files with crop detected
+        crop_value = list(crop_groups.keys())[0]
+        print(f"Detected crop: {format_crop_info(crop_value)}")
+        print()
+        print(f"Consistent across {len(files_with_crop)} file(s): Yes")
+        if files_without_crop:
+            print(f"Files without crop detected: {len(files_without_crop)}")
+        print()
+        
+        print("Files with detected crop:")
+        for rf in files_with_crop[:10]:  # Show first 10
+            print(f"  - {rf.path.name}")
+        if len(files_with_crop) > 10:
+            print(f"  ... and {len(files_with_crop) - 10} more")
+        print()
+        
+        while True:
+            print("Commands:")
+            print("  [e]nable   - Enable crop for files with detected crop")
+            print("  [d]isable  - Disable crop (keep black bars)")
+            print("  [q]uit     - Exit")
+            print()
+            
+            try:
+                cmd = input("crop> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            
+            if cmd == 'q':
+                return False
+            elif cmd == 'e':
+                for rf in files_with_crop:
+                    rf.enable_crop = True
+                print(f"Crop enabled for {len(files_with_crop)} files.")
+                return True
+            elif cmd == 'd':
+                for rf in files:
+                    rf.enable_crop = False
+                print("Crop disabled.")
+                return True
+            else:
+                print("Unknown command")
+    
+    else:
+        # Inconsistent crop values
+        print("Warning: Inconsistent crop values detected!")
+        print()
+        
+        sorted_crops = sorted(crop_groups.items(), key=lambda x: -len(x[1]))
+        
+        for i, (crop_val, crop_files) in enumerate(sorted_crops):
+            label = chr(ord('A') + i)
+            print(f"  Crop {label}: {format_crop_info(crop_val)} ({len(crop_files)} files)")
+            for rf in crop_files[:3]:
+                print(f"    - {rf.path.name}")
+            if len(crop_files) > 3:
+                print(f"    ... and {len(crop_files) - 3} more")
+            print()
+        
+        if files_without_crop:
+            print(f"  No crop detected: {len(files_without_crop)} files")
+            print()
+        
+        majority_crop = sorted_crops[0][0]
+        majority_files = sorted_crops[0][1]
+        
+        while True:
+            print("Commands:")
+            print(f"  [m]ajority - Enable crop using majority value ({len(majority_files)} files)")
+            print("  [d]isable  - Disable crop for all files")
+            print("  [e]xclude  - Exclude files with non-majority crop from selection")
+            print("  [q]uit     - Exit")
+            print()
+            
+            try:
+                cmd = input("crop> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            
+            if cmd == 'q':
+                return False
+            elif cmd == 'm':
+                for rf in majority_files:
+                    rf.enable_crop = True
+                print(f"Crop enabled for {len(majority_files)} files with majority crop value.")
+                return True
+            elif cmd == 'd':
+                for rf in files:
+                    rf.enable_crop = False
+                print("Crop disabled for all files.")
+                return True
+            elif cmd == 'e':
+                for rf in majority_files:
+                    rf.enable_crop = True
+                # Exclude non-majority files
+                for crop_val, crop_files in sorted_crops[1:]:
+                    for rf in crop_files:
+                        rf.selected = False
+                        rf.skip_reason = "Inconsistent crop"
+                print(f"Crop enabled for majority. {sum(len(cf) for _, cf in sorted_crops[1:])} files excluded.")
+                return True
+            else:
+                print("Unknown command")
+    
+    return True
 
 
 # =============================================================================
@@ -828,6 +1147,8 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
             flags.append("[DV]")
         elif rf.is_hdr:
             flags.append("[HDR]")
+        if rf.enable_crop:
+            flags.append("[CROP]")
         if rf.skip_reason and not rf.is_dv:
             flags.append(f"[!]")
         if rf.codec == "hevc":
@@ -835,11 +1156,14 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
         
         flag_str = " ".join(flags)
         
-        print(f"  {i+1:2}. {sel} {flag_str:12} {rel_path}")
+        print(f"  {i+1:2}. {sel} {flag_str:18} {rel_path}")
         
         # Info line
         audio_summary = f"{len(rf.selected_audio_indices)}/{len(rf.audio_tracks)} audio"
         info = f"{rf.codec} | {rf.hdr_status} | {audio_summary} | {rf.size_gb:.2f} GB"
+        
+        if rf.enable_crop:
+            info += f" | crop={rf.detected_crop}"
         
         if rf.skip_reason:
             info += f" | Skip: {rf.skip_reason}"
@@ -925,7 +1249,8 @@ def encode_file(
     x265_params: list[str],
     audio_indices: list[int],
     default_audio_idx: int | None = 0,
-    default_subtitle_idx: int | None = None
+    default_subtitle_idx: int | None = None,
+    crop: str = ""
 ) -> bool:
     """Encode a single file. Returns True on success."""
     temp_output = source.with_suffix(".tmp.mkv")
@@ -946,6 +1271,13 @@ def encode_file(
         "-map", "0:d?",
         "-map_metadata", "0",
         "-map_chapters", "0",
+    ])
+    
+    # Add crop filter if specified
+    if crop:
+        cmd.extend(["-vf", f"crop={crop}"])
+    
+    cmd.extend([
         "-c:v", "libx265",
         "-crf", "14",
         "-preset", "slow",
@@ -1028,16 +1360,20 @@ def process_file(rf: ReencodeFile) -> str:
     audio_indices = rf.selected_audio_indices
     default_audio_idx = rf.get_default_audio_index()
     default_subtitle_idx = rf.get_default_subtitle_index()
+    crop = rf.detected_crop if rf.enable_crop else ""
     
     log(f"Processing: {source.name} (codec: {rf.codec}, {rf.hdr_status})")
     log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_indices)} selected (default: {default_audio_idx})")
     log(f"  Subtitles: {len(rf.subtitle_tracks)} tracks (default: {default_subtitle_idx})")
     
+    if crop:
+        log(f"  Crop: {crop}")
+    
     if rf.x265_params:
         log(f"  HDR params: {':'.join(rf.x265_params)}")
 
     # Encode
-    if not encode_file(source, rf.x265_params, audio_indices, default_audio_idx, default_subtitle_idx):
+    if not encode_file(source, rf.x265_params, audio_indices, default_audio_idx, default_subtitle_idx, crop):
         return "failed"
 
     # Create archive directory
@@ -1153,6 +1489,11 @@ def main():
     
     if not files:
         print("No MKV files found")
+        sys.exit(0)
+
+    # Phase 1b: Crop configuration (if crop detected)
+    if not configure_crop(files):
+        print("Cancelled.")
         sys.exit(0)
 
     # Phase 2: Audio configuration
