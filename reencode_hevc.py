@@ -182,8 +182,6 @@ def reencode_file(filepath: Path) -> tuple[bool, int]:
         '-profile:v', 'main10',         # 10-bit reduces banding
         '-pix_fmt', 'p010le',           # 10-bit pixel format
         '-rc-lookahead', '32',          # Look ahead for better decisions
-        '-spatial-aq', '1',             # Adaptive quantization (spatial)
-        '-temporal-aq', '1',            # Adaptive quantization (temporal)
         '-b_ref_mode', 'middle',        # B-frame reference mode
         '-bf', '4',                     # Number of B-frames
         '-c:a', 'copy',                 # Copy all audio tracks
