@@ -337,12 +337,35 @@ def get_duration(source: Path) -> float:
         return 0.0
 
 
-def detect_crop(source: Path, duration: float, num_samples: int = 8) -> str:
+def detect_crop(source: Path, duration: float, num_samples: int = 32) -> str:
     """
     Detect crop values by sampling multiple points in the video.
     Returns crop string like "1920:800:0:140" or empty string if no crop needed.
+    
+    Filters out invalid crops (letterboxed scenes, credits) by requiring
+    at least one dimension to stay at 90%+ of original.
     """
     if duration <= 0:
+        return ""
+    
+    # Get original resolution first
+    res_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        str(source)
+    ]
+    try:
+        res_result = subprocess.run(res_cmd, capture_output=True, text=True)
+        res_data = json.loads(res_result.stdout)
+        res_stream = res_data.get("streams", [{}])[0]
+        orig_w = res_stream.get("width", 0)
+        orig_h = res_stream.get("height", 0)
+    except Exception:
+        return ""
+    
+    if orig_w == 0 or orig_h == 0:
         return ""
     
     # Generate sample points, avoiding first/last 5% of video
@@ -381,9 +404,28 @@ def detect_crop(source: Path, duration: float, num_samples: int = 8) -> str:
     if not crop_values:
         return ""
     
-    # Find most common crop value
+    # Filter to valid crops: at least one dimension must be >= 90% of original
+    # This filters out letterboxed scenes within content while keeping:
+    # - Pillarboxing (4:3 in 16:9): width reduced, height ~100%
+    # - Letterboxing (2.35:1 in 16:9): height reduced, width ~100%
+    valid_crops = []
+    for crop in crop_values:
+        try:
+            parts = crop.split(":")
+            w, h = int(parts[0]), int(parts[1])
+            width_pct = w / orig_w
+            height_pct = h / orig_h
+            if width_pct >= 0.90 or height_pct >= 0.90:
+                valid_crops.append(crop)
+        except (ValueError, IndexError):
+            continue
+    
+    if not valid_crops:
+        return ""
+    
+    # Find most common valid crop value
     from collections import Counter
-    crop_counter = Counter(crop_values)
+    crop_counter = Counter(valid_crops)
     most_common_crop, count = crop_counter.most_common(1)[0]
     
     # Parse the crop to check if it's meaningful
@@ -391,26 +433,10 @@ def detect_crop(source: Path, duration: float, num_samples: int = 8) -> str:
         parts = most_common_crop.split(":")
         w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
         
-        # Get original resolution to compare
-        stream = probe_video(source)
-        # Try to get resolution from a separate probe
-        res_cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "json",
-            str(source)
-        ]
-        res_result = subprocess.run(res_cmd, capture_output=True, text=True)
-        res_data = json.loads(res_result.stdout)
-        res_stream = res_data.get("streams", [{}])[0]
-        orig_w = res_stream.get("width", w)
-        orig_h = res_stream.get("height", h)
-        
         # Only report crop if it removes at least 20 pixels on any edge
-        # and the result is at least 90% of samples agree
+        # and at least 70% agreement among valid samples
         if (x > 10 or y > 10 or (orig_w - w - x) > 10 or (orig_h - h - y) > 10):
-            if count >= len(crop_values) * 0.7:  # 70% agreement
+            if count >= len(valid_crops) * 0.7:
                 return most_common_crop
     except (ValueError, IndexError):
         pass
