@@ -4,6 +4,7 @@ Batch MKV re-encoder for fixing timestamp issues.
 
 Encodes video to x265 CRF 14 (10-bit) and audio to FLAC.
 Preserves HDR metadata. Skips Dolby Vision content.
+Keeps only lossless audio tracks, drops lossy duplicates.
 Archives originals before replacing.
 
 Usage:
@@ -21,6 +22,17 @@ from datetime import datetime
 MEDIA_BASE = Path("/tank/media")
 ARCHIVE_BASE = Path("/tank/archive/originals")
 LOG_FILE = Path("/tank/archive/reencode.log")
+
+# Audio codec classification
+LOSSLESS_AUDIO = {
+    "DTS-HD MA", "DTS-HD HR", "TrueHD", "FLAC", "PCM", "LPCM", "ALAC",
+    "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le",
+    "truehd", "flac", "alac", "mlp"
+}
+LOSSY_AUDIO = {
+    "DTS", "AC3", "EAC3", "AAC", "MP3", "Opus", "Vorbis",
+    "dts", "ac3", "eac3", "aac", "mp3", "opus", "vorbis"
+}
 
 
 def log(message: str):
@@ -58,6 +70,82 @@ def probe_video(source: Path) -> dict:
         return data.get("streams", [{}])[0]
     except Exception:
         return {}
+
+
+def get_audio_tracks(source: Path) -> list:
+    """Get all audio track info."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index,codec_name,profile,channels:stream_tags=language,title",
+        "-of", "json",
+        str(source)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        return data.get("streams", [])
+    except Exception:
+        return []
+
+
+def select_audio_tracks(tracks: list) -> tuple:
+    """
+    Select audio tracks: keep lossless, drop lossy duplicates.
+    Returns (selected_indices, warnings)
+    """
+    if not tracks:
+        return [], []
+    
+    warnings = []
+    
+    # Group tracks by language + channels
+    groups = {}
+    for track in tracks:
+        lang = track.get("tags", {}).get("language", "und")
+        channels = track.get("channels", 0)
+        key = (lang, channels)
+        
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(track)
+    
+    selected = []
+    
+    for (lang, channels), group_tracks in groups.items():
+        lossless = []
+        lossy = []
+        unknown = []
+        
+        for track in group_tracks:
+            codec = track.get("codec_name", "")
+            profile = track.get("profile", "")
+            
+            # Check profile first (more specific), then codec
+            identifier = profile if profile else codec
+            
+            if identifier in LOSSLESS_AUDIO or codec in LOSSLESS_AUDIO:
+                lossless.append(track)
+            elif identifier in LOSSY_AUDIO or codec in LOSSY_AUDIO:
+                lossy.append(track)
+            else:
+                unknown.append(track)
+                warnings.append(f"Unknown audio: {identifier} ({lang}, {channels}ch) - keeping")
+        
+        # Select: prefer lossless, fall back to lossy, always keep unknown
+        if lossless:
+            selected.extend(lossless)
+        elif lossy:
+            selected.extend(lossy)
+        
+        # Always keep unknown codecs
+        selected.extend(unknown)
+    
+    # Sort by original index to maintain order
+    selected.sort(key=lambda t: t.get("index", 0))
+    indices = [t.get("index") for t in selected]
+    
+    return indices, warnings
 
 
 def is_dolby_vision(source: Path) -> bool:
@@ -149,7 +237,6 @@ def get_hdr_params(source: Path) -> tuple:
         sd_type = sd.get("side_data_type", "")
         
         if sd_type == "Mastering display metadata":
-            # Extract color coordinates (need to convert from ratio strings)
             try:
                 def parse_ratio(s):
                     if "/" in str(s):
@@ -168,7 +255,6 @@ def get_hdr_params(source: Path) -> tuple:
                 lmax, lmax_d = parse_ratio(sd.get("max_luminance", "0/1"))
                 lmin, lmin_d = parse_ratio(sd.get("min_luminance", "0/1"))
                 
-                # x265 expects values scaled to 50000 for coordinates, 10000 for luminance
                 def scale_coord(num, den):
                     return int(num * 50000 / den) if den else 0
                 
@@ -197,7 +283,7 @@ def get_hdr_params(source: Path) -> tuple:
     return x265_params, True
 
 
-def encode_file(source: Path, x265_params: list, is_hdr: bool) -> bool:
+def encode_file(source: Path, x265_params: list, audio_indices: list) -> bool:
     """Encode a single file. Returns True on success."""
     temp_output = source.with_suffix(".tmp.mkv")
 
@@ -205,8 +291,19 @@ def encode_file(source: Path, x265_params: list, is_hdr: bool) -> bool:
         "ffmpeg",
         "-hide_banner",
         "-i", str(source),
-        # Map everything from source
-        "-map", "0",
+        # Map video
+        "-map", "0:v",
+    ]
+    
+    # Map selected audio tracks
+    for idx in audio_indices:
+        cmd.extend(["-map", f"0:{idx}"])
+    
+    # Map subtitles and attachments
+    cmd.extend([
+        "-map", "0:s?",
+        "-map", "0:t?",
+        "-map", "0:d?",
         # Preserve all metadata
         "-map_metadata", "0",
         "-map_chapters", "0",
@@ -216,7 +313,7 @@ def encode_file(source: Path, x265_params: list, is_hdr: bool) -> bool:
         "-preset", "slow",
         "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
-    ]
+    ])
     
     # Add x265 params for HDR if needed
     if x265_params:
@@ -270,18 +367,10 @@ def encode_file(source: Path, x265_params: list, is_hdr: bool) -> bool:
 def process_file(source: Path) -> str:
     """
     Encode, archive original, replace with new file.
-    Returns: 'success', 'skipped', 'skipped_dv', or 'failed'
+    Returns: 'success', 'skipped_dv', or 'failed'
     """
     temp_output = source.with_suffix(".tmp.mkv")
     archive_path = get_archive_path(source)
-
-    # Check if already HEVC
-    stream = probe_video(source)
-    codec = stream.get("codec_name", "unknown")
-    
-    if codec == "hevc":
-        log(f"SKIPPED (already HEVC): {source.name}")
-        return "skipped"
 
     # Check for Dolby Vision
     if is_dolby_vision(source):
@@ -289,17 +378,29 @@ def process_file(source: Path) -> str:
         log(f"  Warning: DV content requires special handling and cannot be re-encoded without losing DV metadata")
         return "skipped_dv"
 
+    # Get video info
+    stream = probe_video(source)
+    codec = stream.get("codec_name", "unknown")
+    
     # Get HDR params
     x265_params, is_hdr = get_hdr_params(source)
     
+    # Get audio tracks and select lossless
+    audio_tracks = get_audio_tracks(source)
+    audio_indices, audio_warnings = select_audio_tracks(audio_tracks)
+    
     hdr_status = "HDR" if is_hdr else "SDR"
     log(f"Processing: {source.name} (codec: {codec}, {hdr_status})")
+    log(f"  Audio: {len(audio_tracks)} tracks -> {len(audio_indices)} selected")
+    
+    for warning in audio_warnings:
+        log(f"  {warning}")
     
     if x265_params:
         log(f"  HDR params: {':'.join(x265_params)}")
 
     # Encode
-    if not encode_file(source, x265_params, is_hdr):
+    if not encode_file(source, x265_params, audio_indices):
         return "failed"
 
     # Create archive directory
@@ -348,24 +449,44 @@ def main():
         print("No MKV files found")
         sys.exit(0)
 
+    # Show files and ask for confirmation
+    print(f"\nFound {len(mkv_files)} MKV files in {source_dir}:\n")
+    for i, mkv in enumerate(mkv_files, 1):
+        try:
+            rel_path = mkv.relative_to(source_dir)
+        except ValueError:
+            rel_path = mkv.name
+        size_gb = mkv.stat().st_size / (1024**3)
+        print(f"  {i:3}. {rel_path} ({size_gb:.2f} GB)")
+    
+    print(f"\nArchive location: {ARCHIVE_BASE}")
+    print(f"Log file: {LOG_FILE}")
+    print()
+    
+    confirm = input("Proceed with encoding? [y/N]: ").strip().lower()
+    if confirm != 'y':
+        print("Aborted.")
+        sys.exit(0)
+
     log(f"{'='*60}")
     log(f"Starting batch encode: {len(mkv_files)} files in {source_dir}")
     log(f"{'='*60}")
 
     success = 0
-    skipped = 0
     skipped_dv = 0
     failed = 0
 
     for i, mkv in enumerate(mkv_files, 1):
-        log(f"[{i}/{len(mkv_files)}] {mkv.relative_to(source_dir)}")
+        try:
+            rel_path = mkv.relative_to(source_dir)
+        except ValueError:
+            rel_path = mkv.name
+        log(f"[{i}/{len(mkv_files)}] {rel_path}")
 
         result = process_file(mkv)
         
         if result == "success":
             success += 1
-        elif result == "skipped":
-            skipped += 1
         elif result == "skipped_dv":
             skipped_dv += 1
         else:
@@ -374,7 +495,6 @@ def main():
     log(f"{'='*60}")
     log(f"Complete:")
     log(f"  Encoded:    {success}")
-    log(f"  Skipped:    {skipped} (already HEVC)")
     log(f"  Skipped DV: {skipped_dv} (Dolby Vision)")
     log(f"  Failed:     {failed}")
     log(f"{'='*60}")
