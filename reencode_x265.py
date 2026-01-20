@@ -142,6 +142,8 @@ class ReencodeFile:
     subtitle_tracks: list[SubtitleTrack]
     x265_params: list[str]
     size_gb: float
+    original_width: int = 0
+    original_height: int = 0
     duration_seconds: float = 0.0
     detected_crop: str = ""           # Detected crop string (e.g., "1920:800:0:140")
     enable_crop: bool = False         # Whether to apply crop during encode
@@ -189,6 +191,26 @@ class ReencodeFile:
             return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
         except (ValueError, IndexError):
             return None
+    
+    @property
+    def resolution_str(self) -> str:
+        """Current resolution as string."""
+        if self.original_width and self.original_height:
+            return f"{self.original_width}x{self.original_height}"
+        return "?"
+    
+    @property
+    def output_resolution_str(self) -> str:
+        """Output resolution after crop (or same if no crop)."""
+        if self.enable_crop and self.crop_dimensions:
+            w, h, _, _ = self.crop_dimensions
+            return f"{w}x{h}"
+        return self.resolution_str
+    
+    @property
+    def is_already_x265(self) -> bool:
+        """Check if file is already x265/HEVC encoded."""
+        return self.codec in ("hevc", "h265")
     
     def get_default_audio_index(self) -> int | None:
         """Get the output stream index for default audio track."""
@@ -585,6 +607,24 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         stream = probe_video(mkv_path)
         codec = stream.get("codec_name", "unknown")
         
+        # Get resolution
+        res_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(mkv_path)
+        ]
+        try:
+            res_result = subprocess.run(res_cmd, capture_output=True, text=True)
+            res_data = json.loads(res_result.stdout)
+            res_stream = res_data.get("streams", [{}])[0]
+            orig_width = res_stream.get("width", 0)
+            orig_height = res_stream.get("height", 0)
+        except Exception:
+            orig_width = 0
+            orig_height = 0
+        
         # Check DV first
         dv = is_dolby_vision(mkv_path)
         
@@ -615,6 +655,8 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
             subtitle_tracks=subtitle_tracks,
             x265_params=x265_params,
             size_gb=size_gb,
+            original_width=orig_width,
+            original_height=orig_height,
             duration_seconds=duration,
             detected_crop=detected_crop,
             selected=not dv,  # Auto-deselect DV files
@@ -1191,14 +1233,12 @@ def configure_defaults(files: list[ReencodeFile]) -> bool:
 # =============================================================================
 
 def display_files(files: list[ReencodeFile], source_dir: Path):
-    """Display file list with status."""
+    """Display file list with current state and intended changes."""
     print()
     print("=" * 60)
     print("File Selection")
     print("=" * 60)
     print()
-    
-    total_size = sum(f.size_gb for f in files if f.selected)
     
     for i, rf in enumerate(files):
         try:
@@ -1208,38 +1248,76 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
         
         sel = "[x]" if rf.selected else "[ ]"
         
-        # Build flags
+        # Build status flags
         flags = []
         if rf.is_dv:
-            flags.append("[DV]")
-        elif rf.is_hdr:
-            flags.append("[HDR]")
-        if rf.enable_crop:
-            flags.append("[CROP]")
-        if rf.skip_reason and not rf.is_dv:
-            flags.append(f"[!]")
-        if rf.codec == "hevc":
-            flags.append("[x265]")
-        
-        flag_str = " ".join(flags)
-        
-        print(f"  {i+1:2}. {sel} {flag_str:18} {rel_path}")
-        
-        # Info line
-        audio_summary = f"{len(rf.selected_audio_indices)}/{len(rf.audio_tracks)} audio"
-        info = f"{rf.codec} | {rf.hdr_status} | {audio_summary} | {rf.size_gb:.2f} GB"
-        
-        if rf.enable_crop:
-            info += f" | crop={rf.detected_crop}"
-        
+            flags.append("DV")
+        if rf.is_hdr and not rf.is_dv:
+            flags.append("HDR")
         if rf.skip_reason:
-            info += f" | Skip: {rf.skip_reason}"
+            flags.append("!")
         
-        print(f"          {info}")
+        flag_str = f"[{','.join(flags)}] " if flags else ""
+        
+        print(f"  {i+1:2}. {sel} {flag_str}{rel_path}")
+        
+        # Now line - current state
+        now_parts = [
+            rf.codec,
+            rf.resolution_str,
+            f"{len(rf.audio_tracks)} audio",
+            f"{rf.size_gb:.2f} GB"
+        ]
+        print(f"        Now:   {' | '.join(now_parts)}")
+        
+        # After line - what will happen
+        if rf.is_dv:
+            print(f"        After: [SKIP - Dolby Vision]")
+        elif rf.is_already_x265 and not rf.enable_crop:
+            print(f"        After: [SKIP - already x265, no crop]")
+        elif rf.skip_reason:
+            print(f"        After: [SKIP - {rf.skip_reason}]")
+        else:
+            after_codec = "x265"
+            after_res = rf.output_resolution_str
+            after_audio = f"{len(rf.selected_audio_indices)} audio (FLAC)"
+            
+            # Show what's changing
+            changes = []
+            if not rf.is_already_x265:
+                changes.append(f"{rf.codec}->{after_codec}")
+            else:
+                changes.append(after_codec)
+            
+            if rf.enable_crop:
+                changes.append(f"{rf.resolution_str}->{after_res}")
+            else:
+                changes.append(after_res)
+            
+            changes.append(after_audio)
+            
+            print(f"        After: {' | '.join(changes)}")
     
     print()
+    
+    # Summary
+    selected = [f for f in files if f.selected]
+    to_encode = [f for f in selected if not f.is_dv and not f.skip_reason]
+    already_x265 = [f for f in to_encode if f.is_already_x265 and not f.enable_crop]
+    will_process = [f for f in to_encode if not (f.is_already_x265 and not f.enable_crop)]
+    with_crop = [f for f in will_process if f.enable_crop]
+    
     print(f"Archive location: {ARCHIVE_BASE}")
     print(f"Log file: {LOG_FILE}")
+    print()
+    print(f"Summary:")
+    print(f"  Selected: {len(selected)}/{len(files)} files")
+    if already_x265:
+        print(f"  Already x265 (will re-encode): {len(already_x265)} files")
+    if will_process:
+        print(f"  Will encode: {len(will_process)} files ({sum(f.size_gb for f in will_process):.2f} GB)")
+    if with_crop:
+        print(f"  With crop: {len(with_crop)} files")
     print()
 
 
@@ -1255,14 +1333,12 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         selected_count = len(selected)
         total_size = sum(f.size_gb for f in selected)
         dv_count = sum(1 for f in files if f.is_dv)
+        not_x265_count = sum(1 for f in files if not f.is_already_x265 and not f.is_dv)
         
-        print(f"Selected: {selected_count}/{len(files)} files ({total_size:.2f} GB)")
-        if dv_count > 0:
-            print(f"Dolby Vision (excluded): {dv_count}")
-        print()
         print("Commands:")
         print("  [a]ll      - Select all (except DV)")
         print("  [n]one     - Deselect all")
+        print(f"  [u]nproc   - Select only non-x265 files ({not_x265_count} files)")
         print("  [i]nvert   - Invert selection")
         print("  [1-99]     - Toggle file by number")
         print("  [g]o       - Start encoding")
@@ -1289,6 +1365,9 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         elif cmd == 'n':
             for f in files:
                 f.selected = False
+        elif cmd == 'u':
+            for f in files:
+                f.selected = not f.is_already_x265 and not f.is_dv
         elif cmd == 'i':
             for f in files:
                 if not f.is_dv:
