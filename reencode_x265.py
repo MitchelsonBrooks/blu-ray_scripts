@@ -17,7 +17,6 @@ import shutil
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from math import gcd
 from pathlib import Path
 from datetime import datetime
 
@@ -772,11 +771,9 @@ def format_crop_info(crop_str: str) -> str:
     
     try:
         parts = crop_str.split(":")
-        w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        w, h = int(parts[0]), int(parts[1])
 
         # Calculate aspect ratio
-        divisor = gcd(w, h)
-        ar_w, ar_h = w // divisor, h // divisor
         ar_decimal = w / h
         
         # Common aspect ratio names
@@ -1376,15 +1373,7 @@ def configure_file_individually(rf: ReencodeFile, file_num: int, total_files: in
             sel = "[x]" if track.selected else "[ ]"
             default_marker = " <- default" if i == default_audio_track_idx else ""
             print(f"  {i+1}. {sel} {track}{default_marker}")
-        
-        # Find current default audio index among selected
-        default_audio_display = "1"
-        selected_tracks = [t for t in rf.audio_tracks if t.selected]
-        for i, t in enumerate(selected_tracks):
-            if t.language == rf.default_audio_lang:
-                default_audio_display = str(i + 1)
-                break
-        
+
         print()
         
         # Subtitle tracks
@@ -1661,8 +1650,6 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         
         selected = [f for f in files if f.selected]
         selected_count = len(selected)
-        total_size = sum(f.size_gb for f in selected)
-        dv_count = sum(1 for f in files if f.is_dv)
         not_x265_count = sum(1 for f in files if not f.is_already_x265 and not f.is_dv)
         
         print("Commands:")
