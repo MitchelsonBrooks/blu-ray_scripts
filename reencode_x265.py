@@ -2,7 +2,7 @@
 """
 Interactive batch MKV re-encoder for fixing timestamp issues.
 
-Encodes video to x265 CRF 14 (10-bit) and audio to FLAC.
+Encodes video to x265 CRF 12 (10-bit) and audio to FLAC.
 Preserves HDR metadata. Skips Dolby Vision content.
 Configurable audio track selection with lossless preference.
 Archives originals before replacing.
@@ -1274,22 +1274,24 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
         if rf.is_dv:
             print(f"        After: [SKIP - Dolby Vision]")
         elif rf.is_already_x265 and not rf.enable_crop:
-            print(f"        After: [SKIP - already x265, no crop]")
+            print(f"        After: [SKIP - already hevc, no crop]")
         elif rf.skip_reason:
             print(f"        After: [SKIP - {rf.skip_reason}]")
         else:
-            after_codec = "x265"
             after_res = rf.output_resolution_str
             after_audio = f"{len(rf.selected_audio_indices)} audio (FLAC)"
             
             # Show what's changing
             changes = []
-            if not rf.is_already_x265:
-                changes.append(f"{rf.codec}->{after_codec}")
-            else:
-                changes.append(after_codec)
             
-            if rf.enable_crop:
+            # Codec change (use hevc consistently)
+            if not rf.is_already_x265:
+                changes.append(f"{rf.codec}->hevc")
+            else:
+                changes.append("hevc")
+            
+            # Resolution change (only show arrow if actually changing)
+            if rf.enable_crop and rf.resolution_str != after_res:
                 changes.append(f"{rf.resolution_str}->{after_res}")
             else:
                 changes.append(after_res)
@@ -1313,7 +1315,7 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
     print(f"Summary:")
     print(f"  Selected: {len(selected)}/{len(files)} files")
     if already_x265:
-        print(f"  Already x265 (will re-encode): {len(already_x265)} files")
+        print(f"  Already hevc (will re-encode): {len(already_x265)} files")
     if will_process:
         print(f"  Will encode: {len(will_process)} files ({sum(f.size_gb for f in will_process):.2f} GB)")
     if with_crop:
@@ -1338,7 +1340,7 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         print("Commands:")
         print("  [a]ll      - Select all (except DV)")
         print("  [n]one     - Deselect all")
-        print(f"  [u]nproc   - Select only non-x265 files ({not_x265_count} files)")
+        print(f"  [u]nproc   - Select only non-hevc files ({not_x265_count} files)")
         print("  [i]nvert   - Invert selection")
         print("  [1-99]     - Toggle file by number")
         print("  [g]o       - Start encoding")
@@ -1425,8 +1427,8 @@ def encode_file(
     
     cmd.extend([
         "-c:v", "libx265",
-        "-crf", "14",
-        "-preset", "slow",
+        "-crf", "12",
+        "-preset", "slower",
         "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
     ])
