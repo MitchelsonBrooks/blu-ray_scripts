@@ -7,11 +7,14 @@ Preserves HDR metadata. Skips Dolby Vision content.
 Configurable audio track selection with lossless preference.
 Archives originals before replacing.
 
-Scanning detects timestamp issues (non-monotonic DTS/PTS, discontinuities)
-in both video and audio streams to help identify files that need re-encoding.
-
 Usage:
     python3 reencode_x265.py /tank/media/anime/Show/
+    python3 reencode_x265.py -t /tank/media/anime/Show/
+
+Options:
+    -t, --timestamps    Analyze files for timestamp issues (slower but thorough).
+                        Detects non-monotonic DTS/PTS, discontinuities, and
+                        negative timestamps in video and audio streams.
 """
 
 import subprocess
@@ -478,16 +481,19 @@ def detect_timestamp_issues(source: Path, duration: float, sample_duration: floa
     """
     Detect timestamp issues in video and audio streams.
 
-    Decodes a sample of the file and captures FFmpeg warnings about:
+    Decodes portions of the file and captures FFmpeg warnings about:
     - Non-monotonic DTS/PTS
     - Timestamp discontinuities
     - Negative timestamps
     - Invalid timestamps
 
+    Uses accurate seeking (-ss after -i) to ensure all frames are processed
+    and timestamp issues are not skipped due to keyframe seeking.
+
     Args:
         source: Path to the video file
         duration: Total duration in seconds
-        sample_duration: How many seconds to sample (from start, middle, end)
+        sample_duration: How many seconds to sample per point
 
     Returns:
         List of TimestampIssue objects describing problems found
@@ -495,13 +501,17 @@ def detect_timestamp_issues(source: Path, duration: float, sample_duration: floa
     import re
 
     # Patterns to match timestamp issues in FFmpeg output
+    # These patterns are matched case-insensitively
     patterns = {
         "non_monotonic": [
             r"DTS .* < .* out of order",
             r"non monotonically increasing dts",
             r"Non-monotonous DTS",
             r"Application provided invalid.*timestamps",
-            r"pts .* < .* invalid, clipping",
+            r"pts .* < .* invalid",
+            r"dts .* < .* invalid",
+            r"out of order dts",
+            r"packet with invalid pts",
         ],
         "discontinuity": [
             r"discont.*detected",
@@ -509,17 +519,20 @@ def detect_timestamp_issues(source: Path, duration: float, sample_duration: floa
             r"DTS discontinuity",
             r"PTS discontinuity",
             r"discarding .* with pts=",
+            r"discarding frame due to timestamp",
         ],
         "negative": [
-            r"Discarding negative timestamp",
-            r"negative .* timestamps",
-            r"clipping audio",
+            r"discarding.*negative",
+            r"negative.*timestamp",
+            r"clipping.*timestamp",
+            r"discarding packet.*before start",
         ],
         "invalid": [
             r"discarding corrupted packet",
             r"Invalid NAL unit",
             r"decode_slice_header error",
             r"Invalid timestamp",
+            r"discarding.*packet",
         ],
     }
 
@@ -542,10 +555,11 @@ def detect_timestamp_issues(source: Path, duration: float, sample_duration: floa
         current_stream_idx = 0
 
         for line in lines:
-            # Try to identify stream context
-            if "Video:" in line or "v:" in line.lower():
+            # Try to identify stream context from the line itself
+            line_lower = line.lower()
+            if "video" in line_lower or ":v" in line_lower or "v:" in line_lower:
                 current_stream_type = "video"
-            elif "Audio:" in line or "a:" in line.lower():
+            elif "audio" in line_lower or ":a" in line_lower or "a:" in line_lower:
                 current_stream_type = "audio"
 
             stream_match = stream_pattern.search(line)
@@ -565,32 +579,54 @@ def detect_timestamp_issues(source: Path, duration: float, sample_duration: floa
                             issues_by_key[key].append("")  # Count only
                         break
 
-    # Sample points: start, middle, end
-    sample_points = [0]
-    if duration > sample_duration * 2:
-        sample_points.append(duration / 2 - sample_duration / 2)
-    if duration > sample_duration:
-        sample_points.append(max(0, duration - sample_duration))
+    # For short files (< 5 min), scan the entire file
+    # For longer files, sample at multiple points with accurate seeking
+    if duration <= 300:
+        # Short file: scan entirely
+        sample_configs = [(None, None)]  # No seeking, no duration limit
+    else:
+        # Longer file: sample at start, 25%, 50%, 75%, and end
+        # Use longer sample duration (90s) for better coverage
+        sample_duration = max(sample_duration, 90.0)
+        sample_configs = [
+            (None, sample_duration),  # Start (no seek, accurate)
+            (duration * 0.25, sample_duration),
+            (duration * 0.50, sample_duration),
+            (duration * 0.75, sample_duration),
+            (max(0, duration - sample_duration), sample_duration),  # End
+        ]
 
-    for start_time in sample_points:
-        # Run FFmpeg to decode and check for issues
-        # Use -v warning to see timestamp problems
+    for start_time, duration_limit in sample_configs:
+        # Build FFmpeg command
+        # IMPORTANT: -ss AFTER -i for accurate frame-by-frame decoding
+        # This ensures we don't skip timestamp issues due to keyframe seeking
         cmd = [
             "ffmpeg",
             "-v", "warning",
-            "-ss", str(start_time),
             "-i", str(source),
-            "-t", str(sample_duration),
-            "-f", "null",
-            "-"
         ]
 
+        # Add accurate seek if specified (after input for frame-accurate)
+        if start_time is not None:
+            cmd.extend(["-ss", str(start_time)])
+
+        # Add duration limit if specified
+        if duration_limit is not None:
+            cmd.extend(["-t", str(duration_limit)])
+
+        cmd.extend([
+            "-f", "null",
+            "-"
+        ])
+
         try:
+            # Increase timeout for accurate seeking which is slower
+            timeout = 300 if start_time is not None else 600
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=timeout
             )
             analyze_output(result.stderr)
         except subprocess.TimeoutExpired:
@@ -849,7 +885,7 @@ def get_hdr_params(source: Path) -> tuple[list[str], bool]:
 # Phase 1: Scanning
 # =============================================================================
 
-def scan_files(source_dir: Path) -> list[ReencodeFile]:
+def scan_files(source_dir: Path, check_timestamps: bool = False) -> list[ReencodeFile]:
     """Scan all MKV files and analyze them."""
     mkv_paths = sorted(source_dir.glob("**/*.mkv"))
 
@@ -857,7 +893,10 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         return []
 
     print(f"Scanning {len(mkv_paths)} MKV files...")
-    print("  (includes crop detection and timestamp analysis)")
+    if check_timestamps:
+        print("  (includes crop detection and timestamp analysis)")
+    else:
+        print("  (includes crop detection)")
     print()
 
     files = []
@@ -891,9 +930,11 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
         # File size
         size_gb = mkv_path.stat().st_size / (1024**3)
 
-        # Detect timestamp issues
-        print(f"\r  [{i}/{len(mkv_paths)}] {mkv_path.name[:40]:<40} [timestamps]", end="", flush=True)
-        timestamp_issues = detect_timestamp_issues(mkv_path, duration)
+        # Detect timestamp issues (only if requested)
+        timestamp_issues = None
+        if check_timestamps:
+            print(f"\r  [{i}/{len(mkv_paths)}] {mkv_path.name[:40]:<40} [timestamps]", end="", flush=True)
+            timestamp_issues = detect_timestamp_issues(mkv_path, duration)
 
         rf = ReencodeFile(
             path=mkv_path,
@@ -1734,7 +1775,7 @@ def configure_per_file(files: list[ReencodeFile]) -> bool:
 # Phase 3: File Selection
 # =============================================================================
 
-def display_files(files: list[ReencodeFile], source_dir: Path):
+def display_files(files: list[ReencodeFile], source_dir: Path, timestamps_checked: bool = False):
     """Display file list with current state and intended changes."""
     print()
     print("=" * 60)
@@ -1756,7 +1797,7 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
             flags.append("DV")
         if rf.is_hdr and not rf.is_dv:
             flags.append("HDR")
-        if rf.has_timestamp_issues:
+        if timestamps_checked and rf.has_timestamp_issues:
             flags.append("TS!")
         if rf.skip_reason:
             flags.append("!")
@@ -1773,11 +1814,12 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
             f"{rf.size_gb:.2f} GB"
         ]
 
-        # Add timestamp status
-        if rf.has_timestamp_issues:
-            now_parts.append(f"TS:{rf.timestamp_summary}")
-        else:
-            now_parts.append("TS:OK")
+        # Add timestamp status only if checked
+        if timestamps_checked:
+            if rf.has_timestamp_issues:
+                now_parts.append(f"TS:{rf.timestamp_summary}")
+            else:
+                now_parts.append("TS:OK")
 
         print(f"        Now:   {' | '.join(now_parts)}")
         
@@ -1839,14 +1881,15 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
     if will_skip:
         print(f"  Will skip (no changes): {len(will_skip)} files")
 
-    # Timestamp summary
-    files_with_ts_issues = [f for f in files if f.has_timestamp_issues]
-    print()
-    print(f"Timestamp issues:")
-    print(f"  Files with issues: {len(files_with_ts_issues)}/{len(files)}")
-    if files_with_ts_issues:
-        total_issues = sum(f.timestamp_issue_count for f in files_with_ts_issues)
-        print(f"  Total issue count: {total_issues}")
+    # Timestamp summary (only if checked)
+    if timestamps_checked:
+        files_with_ts_issues = [f for f in files if f.has_timestamp_issues]
+        print()
+        print(f"Timestamp issues:")
+        print(f"  Files with issues: {len(files_with_ts_issues)}/{len(files)}")
+        if files_with_ts_issues:
+            total_issues = sum(f.timestamp_issue_count for f in files_with_ts_issues)
+            print(f"  Total issue count: {total_issues}")
 
     print()
 
@@ -1872,15 +1915,15 @@ def show_timestamp_details(rf: ReencodeFile):
     print()
 
 
-def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
+def interactive_selection(files: list[ReencodeFile], source_dir: Path, timestamps_checked: bool = False) -> bool:
     """
     Interactive file selection loop.
     Returns True to proceed, False to quit.
     """
-    files_with_ts_issues = [f for f in files if f.has_timestamp_issues]
+    files_with_ts_issues = [f for f in files if f.has_timestamp_issues] if timestamps_checked else []
 
     while True:
-        display_files(files, source_dir)
+        display_files(files, source_dir, timestamps_checked)
 
         selected = [f for f in files if f.selected]
         selected_count = len(selected)
@@ -1890,8 +1933,9 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         print("  [a]ll      - Select all (except DV)")
         print("  [n]one     - Deselect all")
         print(f"  [u]nproc   - Select only non-hevc files ({not_x265_count} files)")
-        print(f"  [t]s       - Select only files with timestamp issues ({len(files_with_ts_issues)} files)")
-        print("  ts <num>   - Show timestamp details for file")
+        if timestamps_checked:
+            print(f"  [t]s       - Select only files with timestamp issues ({len(files_with_ts_issues)} files)")
+            print("  ts <num>   - Show timestamp details for file")
         print("  [i]nvert   - Invert selection")
         print("  [1-99]     - Toggle file by number")
         print("  [g]o       - Start encoding")
@@ -1921,11 +1965,11 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
         elif cmd == 'u':
             for f in files:
                 f.selected = not f.is_already_x265 and not f.is_dv
-        elif cmd == 't':
+        elif cmd == 't' and timestamps_checked:
             # Select only files with timestamp issues
             for f in files:
                 f.selected = f.has_timestamp_issues and not f.is_dv
-        elif cmd.startswith('ts '):
+        elif cmd.startswith('ts ') and timestamps_checked:
             try:
                 idx = int(cmd[3:].strip()) - 1
                 if 0 <= idx < len(files):
@@ -2317,14 +2361,41 @@ def check_dependencies():
             sys.exit(1)
 
 
+def parse_args():
+    """Parse command line arguments."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Interactive batch MKV re-encoder for fixing timestamp issues.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    %(prog)s /tank/media/anime/Show/
+    %(prog)s --timestamps /tank/media/anime/Show/
+    %(prog)s -t /tank/media/movies/
+        """
+    )
+
+    parser.add_argument(
+        "directory",
+        type=Path,
+        help="Directory containing MKV files to process"
+    )
+
+    parser.add_argument(
+        "-t", "--timestamps",
+        action="store_true",
+        help="Analyze files for timestamp issues (slower but thorough)"
+    )
+
+    return parser.parse_args()
+
+
 def main():
     check_dependencies()
+    args = parse_args()
 
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <directory>")
-        sys.exit(1)
-
-    source_dir = Path(sys.argv[1]).expanduser().resolve()
+    source_dir = args.directory.expanduser().resolve()
 
     if not source_dir.exists():
         print(f"Error: Directory does not exist: {source_dir}")
@@ -2335,10 +2406,12 @@ def main():
         sys.exit(1)
 
     print(f"Directory: {source_dir}")
+    if args.timestamps:
+        print("Timestamp analysis: enabled")
     print()
 
     # Phase 1: Scan
-    files = scan_files(source_dir)
+    files = scan_files(source_dir, check_timestamps=args.timestamps)
     
     if not files:
         print("No MKV files found")
@@ -2375,7 +2448,7 @@ def main():
             sys.exit(0)
 
     # Phase 3: File selection
-    if not interactive_selection(files, source_dir):
+    if not interactive_selection(files, source_dir, timestamps_checked=args.timestamps):
         print("Cancelled.")
         sys.exit(0)
 
