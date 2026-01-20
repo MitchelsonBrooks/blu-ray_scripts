@@ -2037,7 +2037,7 @@ def encode_file(
     cmd.extend([
         "-c:v", "libx265",
         "-crf", "12",
-        "-preset", "slower",
+        "-preset", "slow",
         "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
     ])
