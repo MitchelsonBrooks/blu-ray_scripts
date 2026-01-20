@@ -15,7 +15,9 @@ import subprocess
 import sys
 import shutil
 import json
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from math import gcd
 from pathlib import Path
 from datetime import datetime
 
@@ -46,6 +48,7 @@ class AudioTrack:
     profile: str
     is_lossless: bool
     is_lossy: bool
+    is_default: bool = False
     selected: bool = False
     
     @property
@@ -212,6 +215,68 @@ class ReencodeFile:
         """Check if file is already x265/HEVC encoded."""
         return self.codec in ("hevc", "h265")
     
+    @property
+    def needs_video_reencode(self) -> bool:
+        """Check if video needs to be re-encoded (not just remuxed)."""
+        # Need re-encode if: not hevc, or crop enabled
+        if not self.is_already_x265:
+            return True
+        if self.enable_crop:
+            return True
+        return False
+    
+    @property
+    def needs_audio_processing(self) -> bool:
+        """Check if audio tracks need processing (selection change or codec conversion)."""
+        # Check if any selected tracks are not already FLAC
+        for track in self.selected_audio_tracks:
+            if track.codec.upper() != "FLAC":
+                return True
+        # Check if track count changed
+        if len(self.selected_audio_tracks) != len(self.audio_tracks):
+            return True
+        return False
+
+    @property
+    def needs_disposition_update(self) -> bool:
+        """Check if default track dispositions need updating."""
+        selected = self.selected_audio_tracks
+        if not selected:
+            return False
+
+        # Check audio default
+        current_default_audio = None
+        for i, track in enumerate(selected):
+            if track.is_default:
+                current_default_audio = track.language
+                break
+
+        target_default_audio = self.default_audio_lang or (selected[0].language if selected else None)
+        if current_default_audio != target_default_audio:
+            return True
+
+        # Check subtitle default
+        current_default_sub = None
+        for track in self.subtitle_tracks:
+            if track.is_default:
+                current_default_sub = track.language
+                break
+
+        if current_default_sub != self.default_subtitle_lang:
+            return True
+
+        return False
+
+    @property
+    def processing_mode(self) -> str:
+        """Determine processing mode: 'reencode', 'remux', or 'skip'."""
+        if self.needs_video_reencode:
+            return "reencode"
+        elif self.needs_audio_processing or self.needs_disposition_update:
+            return "remux"
+        else:
+            return "skip"
+    
     def get_default_audio_index(self) -> int | None:
         """Get the output stream index for default audio track."""
         selected = self.selected_audio_tracks
@@ -254,11 +319,11 @@ def get_archive_path(source: Path) -> Path:
 
 
 def probe_video(source: Path) -> dict:
-    """Get comprehensive video stream info."""
+    """Get comprehensive video stream info including resolution."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,color_transfer,color_primaries,color_space,pix_fmt",
+        "-show_entries", "stream=codec_name,width,height,color_transfer,color_primaries,color_space,pix_fmt",
         "-show_entries", "stream_side_data",
         "-of", "json",
         str(source)
@@ -276,7 +341,7 @@ def get_audio_tracks(source: Path) -> list[AudioTrack]:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name,profile,channels:stream_tags=language,title",
+        "-show_entries", "stream=index,codec_name,profile,channels:stream_tags=language,title:stream_disposition=default",
         "-of", "json",
         str(source)
     ]
@@ -286,16 +351,17 @@ def get_audio_tracks(source: Path) -> list[AudioTrack]:
         streams = data.get("streams", [])
     except Exception:
         return []
-    
+
     tracks = []
     for stream in streams:
         codec = stream.get("codec_name", "")
         profile = stream.get("profile", "")
         identifier = profile if profile else codec
-        
+        disposition = stream.get("disposition", {})
+
         is_lossless = identifier in LOSSLESS_AUDIO or codec in LOSSLESS_AUDIO
         is_lossy = identifier in LOSSY_AUDIO or codec in LOSSY_AUDIO
-        
+
         track = AudioTrack(
             index=stream.get("index", 0),
             language=stream.get("tags", {}).get("language", "und"),
@@ -303,10 +369,11 @@ def get_audio_tracks(source: Path) -> list[AudioTrack]:
             codec=codec,
             profile=profile,
             is_lossless=is_lossless,
-            is_lossy=is_lossy
+            is_lossy=is_lossy,
+            is_default=disposition.get("default", 0) == 1
         )
         tracks.append(track)
-    
+
     return tracks
 
 
@@ -329,7 +396,7 @@ def get_subtitle_tracks(source: Path) -> list[SubtitleTrack]:
     tracks = []
     for stream in streams:
         disposition = stream.get("disposition", {})
-        
+
         track = SubtitleTrack(
             index=stream.get("index", 0),
             language=stream.get("tags", {}).get("language", "und"),
@@ -337,9 +404,10 @@ def get_subtitle_tracks(source: Path) -> list[SubtitleTrack]:
             title=stream.get("tags", {}).get("title", ""),
             is_forced=disposition.get("forced", 0) == 1,
             is_hearing_impaired=disposition.get("hearing_impaired", 0) == 1,
+            is_default=disposition.get("default", 0) == 1,
         )
         tracks.append(track)
-    
+
     return tracks
 
 
@@ -363,12 +431,16 @@ def detect_crop(source: Path, duration: float, num_samples: int = 32) -> str:
     """
     Detect crop values by sampling multiple points in the video.
     Returns crop string like "1920:800:0:140" or empty string if no crop needed.
-    
+
     Filters out invalid crops (letterboxed scenes, credits) by requiring
     at least one dimension to stay at 90%+ of original.
     """
     if duration <= 0:
         return ""
+
+    # Guard against invalid num_samples
+    if num_samples < 2:
+        num_samples = 2
     
     # Get original resolution first
     res_cmd = [
@@ -444,9 +516,8 @@ def detect_crop(source: Path, duration: float, num_samples: int = 32) -> str:
     
     if not valid_crops:
         return ""
-    
+
     # Find most common valid crop value
-    from collections import Counter
     crop_counter = Counter(valid_crops)
     most_common_crop, count = crop_counter.most_common(1)[0]
     
@@ -515,15 +586,19 @@ def get_hdr_params(source: Path) -> tuple[list[str], bool]:
     color_space = stream.get("color_space", "")
     
     is_hdr = color_transfer in ["smpte2084", "arib-std-b67"]
-    
+
     if not is_hdr:
         return [], False
-    
+
     primaries_map = {"bt2020": "bt2020", "bt709": "bt709"}
     transfer_map = {"smpte2084": "smpte2084", "arib-std-b67": "arib-std-b67"}
     matrix_map = {"bt2020nc": "bt2020nc", "bt2020c": "bt2020c", "bt709": "bt709"}
-    
-    x265_params = ["hdr10-opt=1", "repeat-headers=1"]
+
+    # hdr10-opt is only valid for PQ (SMPTE 2084), not HLG
+    if color_transfer == "smpte2084":
+        x265_params = ["hdr10-opt=1", "repeat-headers=1"]
+    else:
+        x265_params = ["repeat-headers=1"]
     
     if color_primaries in primaries_map:
         x265_params.append(f"colorprim={primaries_map[color_primaries]}")
@@ -603,28 +678,12 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
     for i, mkv_path in enumerate(mkv_paths, 1):
         print(f"\r  [{i}/{len(mkv_paths)}] {mkv_path.name[:50]:<50}", end="", flush=True)
         
-        # Get video info
+        # Get video info (includes codec and resolution)
         stream = probe_video(mkv_path)
         codec = stream.get("codec_name", "unknown")
-        
-        # Get resolution
-        res_cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "json",
-            str(mkv_path)
-        ]
-        try:
-            res_result = subprocess.run(res_cmd, capture_output=True, text=True)
-            res_data = json.loads(res_result.stdout)
-            res_stream = res_data.get("streams", [{}])[0]
-            orig_width = res_stream.get("width", 0)
-            orig_height = res_stream.get("height", 0)
-        except Exception:
-            orig_width = 0
-            orig_height = 0
-        
+        orig_width = stream.get("width", 0)
+        orig_height = stream.get("height", 0)
+
         # Check DV first
         dv = is_dolby_vision(mkv_path)
         
@@ -674,7 +733,39 @@ def scan_files(source_dir: Path) -> list[ReencodeFile]:
 # Phase 1b: Crop Configuration
 # =============================================================================
 
-def format_crop_info(crop_str: str, source_path: Path = None) -> str:
+def validate_crop(crop_str: str, max_width: int = 0, max_height: int = 0) -> tuple[bool, str]:
+    """
+    Validate a crop string format and optionally check against max dimensions.
+    Returns (is_valid, error_message).
+    """
+    if not crop_str:
+        return False, "Empty crop value"
+
+    if crop_str.count(":") != 3:
+        return False, "Invalid format. Expected W:H:X:Y (e.g., 1440:1080:240:0)"
+
+    try:
+        parts = crop_str.split(":")
+        w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError:
+        return False, "All values must be integers"
+
+    if w <= 0 or h <= 0:
+        return False, "Width and height must be positive"
+
+    if x < 0 or y < 0:
+        return False, "X and Y offsets cannot be negative"
+
+    if max_width > 0 and max_height > 0:
+        if w + x > max_width:
+            return False, f"Crop width + X offset ({w + x}) exceeds source width ({max_width})"
+        if h + y > max_height:
+            return False, f"Crop height + Y offset ({h + y}) exceeds source height ({max_height})"
+
+    return True, ""
+
+
+def format_crop_info(crop_str: str) -> str:
     """Format crop string with aspect ratio info."""
     if not crop_str:
         return "None"
@@ -682,9 +773,8 @@ def format_crop_info(crop_str: str, source_path: Path = None) -> str:
     try:
         parts = crop_str.split(":")
         w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        
+
         # Calculate aspect ratio
-        from math import gcd
         divisor = gcd(w, h)
         ar_w, ar_h = w // divisor, h // divisor
         ar_decimal = w / h
@@ -711,10 +801,10 @@ def format_crop_info(crop_str: str, source_path: Path = None) -> str:
         return crop_str
 
 
-def configure_crop(files: list[ReencodeFile]) -> bool:
+def configure_crop(files: list[ReencodeFile]) -> bool | str:
     """
     Configure crop settings based on detected values.
-    Returns True to continue, False to quit.
+    Returns True to continue, False to quit, or "perfile" for per-file mode.
     """
     processable = [f for f in files if not f.is_dv]
     
@@ -726,7 +816,6 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
         return True
     
     # Group by crop value
-    from collections import defaultdict
     crop_groups: dict[str, list[ReencodeFile]] = defaultdict(list)
     for rf in files_with_crop:
         crop_groups[rf.detected_crop].append(rf)
@@ -736,27 +825,13 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
     print("Crop Detection Results")
     print("=" * 60)
     print()
-    
-    # Get original resolution from first file for context
+
+    # Get original resolution from first file for context (already stored)
     first_file = files_with_crop[0]
-    res_cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "json",
-        str(first_file.path)
-    ]
-    try:
-        res_result = subprocess.run(res_cmd, capture_output=True, text=True)
-        res_data = json.loads(res_result.stdout)
-        res_stream = res_data.get("streams", [{}])[0]
-        orig_w = res_stream.get("width", 0)
-        orig_h = res_stream.get("height", 0)
-        print(f"Original resolution: {orig_w}x{orig_h}")
+    if first_file.original_width and first_file.original_height:
+        print(f"Original resolution: {first_file.original_width}x{first_file.original_height}")
         print()
-    except Exception:
-        pass
-    
+
     files_without_crop = [f for f in processable if not f.detected_crop]
     
     if len(crop_groups) == 1:
@@ -782,6 +857,7 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
             if files_without_crop:
                 print(f"  [a]ll      - Apply detected crop to ALL {len(processable)} files")
             print("  [o]verride - Set manual crop value for all files")
+            print("  [p]erfile  - Configure crop per-file (manual mode)")
             print("  [d]isable  - Disable crop (keep black bars)")
             print("  [q]uit     - Exit")
             print()
@@ -807,8 +883,13 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                 return True
             elif cmd == 'o':
                 manual_crop = input("Enter crop value (W:H:X:Y): ").strip()
-                if not manual_crop or manual_crop.count(":") != 3:
-                    print("Invalid format. Expected W:H:X:Y (e.g., 1440:1080:240:0)")
+                is_valid, error = validate_crop(
+                    manual_crop,
+                    first_file.original_width,
+                    first_file.original_height
+                )
+                if not is_valid:
+                    print(error)
                     continue
                 confirm = input(f"Apply {manual_crop} to all {len(processable)} files? [y/N]: ").strip().lower()
                 if confirm == 'y':
@@ -817,6 +898,9 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                         rf.enable_crop = True
                     print(f"Crop {manual_crop} applied to all {len(processable)} files.")
                     return True
+            elif cmd == 'p':
+                # Skip to per-file mode (handled after audio config)
+                return "perfile"
             elif cmd == 'd':
                 for rf in files:
                     rf.enable_crop = False
@@ -853,6 +937,7 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
             print(f"  [m]ajority - Enable crop using majority value ({len(majority_files)} files)")
             print(f"  [a]ll      - Apply majority crop to ALL {len(processable)} files")
             print("  [o]verride - Set manual crop value for all files")
+            print("  [p]erfile  - Configure crop per-file (manual mode)")
             print("  [d]isable  - Disable crop for all files")
             print("  [e]xclude  - Exclude files with non-majority crop from selection")
             print("  [q]uit     - Exit")
@@ -879,8 +964,13 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                 return True
             elif cmd == 'o':
                 manual_crop = input("Enter crop value (W:H:X:Y): ").strip()
-                if not manual_crop or manual_crop.count(":") != 3:
-                    print("Invalid format. Expected W:H:X:Y (e.g., 1440:1080:240:0)")
+                is_valid, error = validate_crop(
+                    manual_crop,
+                    first_file.original_width,
+                    first_file.original_height
+                )
+                if not is_valid:
+                    print(error)
                     continue
                 confirm = input(f"Apply {manual_crop} to all {len(processable)} files? [y/N]: ").strip().lower()
                 if confirm == 'y':
@@ -889,6 +979,8 @@ def configure_crop(files: list[ReencodeFile]) -> bool:
                         rf.enable_crop = True
                     print(f"Crop {manual_crop} applied to all {len(processable)} files.")
                     return True
+            elif cmd == 'p':
+                return "perfile"
             elif cmd == 'd':
                 for rf in files:
                     rf.enable_crop = False
@@ -966,10 +1058,10 @@ def display_audio_tracks(tracks: list[AudioTrack], indent: str = "  "):
         print(f"{indent}{i+1}. {sel} {track}")
 
 
-def configure_audio(files: list[ReencodeFile]) -> bool:
+def configure_audio(files: list[ReencodeFile]) -> bool | str:
     """
     Interactive audio configuration.
-    Returns True to continue, False to quit.
+    Returns True to continue, False to quit, or "perfile" for per-file mode.
     """
     # Get files that will actually be processed (not DV)
     processable = [f for f in files if not f.is_dv]
@@ -1008,6 +1100,7 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
             print()
             print("Commands:")
             print("  [a]ccept  - Use this selection for all files")
+            print("  [m]anual  - Configure each file individually")
             print("  [1-9]     - Toggle track by number")
             print("  [q]uit    - Exit without processing")
             print()
@@ -1026,6 +1119,8 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
                     continue
                 apply_audio_selection_to_all(files, template_file.audio_tracks)
                 return True
+            elif cmd == 'm':
+                return "perfile"
             elif cmd.isdigit():
                 idx = int(cmd) - 1
                 if 0 <= idx < len(template_file.audio_tracks):
@@ -1045,6 +1140,11 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
         
         sorted_sigs = sorted(signatures.items(), key=lambda x: -len(x[1]))
         
+        # Check if there's a clear majority
+        total_files = len(processable)
+        largest_group = len(sorted_sigs[0][1])
+        clear_majority = largest_group / total_files > 0.5
+        
         for i, (sig, sig_files) in enumerate(sorted_sigs):
             label = chr(ord('A') + i)
             print(f"  Layout {label} ({len(sig_files)} files):")
@@ -1061,9 +1161,16 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
                 print(f"    - {rf.path.name}")
         print()
         
+        # Auto-recommend per-file mode if no clear majority
+        if not clear_majority:
+            print("  No clear majority layout detected.")
+            print("  Recommend: [m]anual per-file configuration")
+            print()
+        
         while True:
             print("Commands:")
             print("  [c]ontinue - Use automatic selection per-file")
+            print("  [m]anual   - Configure each file individually")
             print("  [e]xclude  - Exclude inconsistent files from selection")
             print("  [q]uit     - Exit to review manually")
             print()
@@ -1081,6 +1188,8 @@ def configure_audio(files: list[ReencodeFile]) -> bool:
                 for rf in files:
                     apply_default_audio_selection(rf.audio_tracks)
                 return True
+            elif cmd == 'm':
+                return "perfile"
             elif cmd == 'e':
                 # Apply default and exclude inconsistent files
                 for rf in files:
@@ -1229,6 +1338,218 @@ def configure_defaults(files: list[ReencodeFile]) -> bool:
 
 
 # =============================================================================
+# Phase 2c: Per-File Configuration (Manual Mode)
+# =============================================================================
+
+def configure_file_individually(rf: ReencodeFile, file_num: int, total_files: int) -> str | None:
+    """
+    Configure a single file's settings interactively.
+    Returns: 'next', 'prev', 'done', or None (quit)
+    """
+    while True:
+        print()
+        print("=" * 60)
+        print(f"File {file_num}/{total_files}: {rf.path.name}")
+        print("=" * 60)
+        print(f"Now: {rf.codec} | {rf.resolution_str} | {rf.size_gb:.2f} GB")
+        print()
+        
+        # Audio tracks
+        print("Audio tracks:")
+        selected_audio = rf.selected_audio_tracks
+        
+        # Find which track is the default (first selected track with default_audio_lang)
+        default_audio_track_idx = None
+        if rf.default_audio_lang:
+            for i, track in enumerate(rf.audio_tracks):
+                if track.selected and track.language == rf.default_audio_lang:
+                    default_audio_track_idx = i
+                    break
+        elif selected_audio:
+            # If no default_audio_lang set, first selected track is default
+            for i, track in enumerate(rf.audio_tracks):
+                if track.selected:
+                    default_audio_track_idx = i
+                    break
+        
+        for i, track in enumerate(rf.audio_tracks):
+            sel = "[x]" if track.selected else "[ ]"
+            default_marker = " <- default" if i == default_audio_track_idx else ""
+            print(f"  {i+1}. {sel} {track}{default_marker}")
+        
+        # Find current default audio index among selected
+        default_audio_display = "1"
+        selected_tracks = [t for t in rf.audio_tracks if t.selected]
+        for i, t in enumerate(selected_tracks):
+            if t.language == rf.default_audio_lang:
+                default_audio_display = str(i + 1)
+                break
+        
+        print()
+        
+        # Subtitle tracks
+        if rf.subtitle_tracks:
+            print("Subtitle tracks:")
+            default_sub_marked = False
+            for i, track in enumerate(rf.subtitle_tracks):
+                # Only mark the first track with matching language as default
+                if rf.default_subtitle_lang == track.language and not default_sub_marked:
+                    default_marker = " <- default"
+                    default_sub_marked = True
+                else:
+                    default_marker = ""
+                print(f"  {i+1}. {track}{default_marker}")
+            print()
+        else:
+            print("Subtitle tracks: None")
+            print()
+        
+        # Crop
+        if rf.enable_crop:
+            print(f"Crop: ENABLED ({rf.detected_crop})")
+        elif rf.detected_crop:
+            print(f"Crop: disabled (detected: {rf.detected_crop})")
+        else:
+            print("Crop: disabled (none detected)")
+        
+        print()
+        print("Commands:")
+        print("  a <num>       - Toggle audio track")
+        print("  ad <num>      - Set default audio (among selected)")
+        if rf.subtitle_tracks:
+            print("  s <num|none>  - Set default subtitle")
+        if rf.detected_crop:
+            print("  crop on       - Enable detected crop")
+        print("  crop off      - Disable crop")
+        print("  crop W:H:X:Y  - Set manual crop")
+        print("  [n]ext        - Next file")
+        if file_num > 1:
+            print("  [p]rev        - Previous file")
+        print("  [d]one        - Finish, go to file selection")
+        print("  [q]uit        - Exit")
+        print()
+        
+        try:
+            cmd = input(f"[{file_num}/{total_files}]> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        
+        if cmd == 'q':
+            return None
+        elif cmd == 'n':
+            return 'next'
+        elif cmd == 'p' and file_num > 1:
+            return 'prev'
+        elif cmd == 'd':
+            return 'done'
+        elif cmd.startswith('a ') and not cmd.startswith('ad '):
+            try:
+                idx = int(cmd[2:].strip()) - 1
+                if 0 <= idx < len(rf.audio_tracks):
+                    rf.audio_tracks[idx].selected = not rf.audio_tracks[idx].selected
+                    # Ensure at least one track selected
+                    if not any(t.selected for t in rf.audio_tracks):
+                        rf.audio_tracks[idx].selected = True
+                        print("Must keep at least one audio track selected")
+                else:
+                    print(f"Invalid track number. Enter 1-{len(rf.audio_tracks)}")
+            except ValueError:
+                print("Invalid input. Use 'a <number>'")
+        elif cmd.startswith('ad '):
+            try:
+                idx = int(cmd[3:].strip()) - 1
+                selected = [t for t in rf.audio_tracks if t.selected]
+                if 0 <= idx < len(selected):
+                    rf.default_audio_lang = selected[idx].language
+                else:
+                    print(f"Invalid track number. Enter 1-{len(selected)}")
+            except ValueError:
+                print("Invalid input. Use 'ad <number>'")
+        elif cmd.startswith('s '):
+            if not rf.subtitle_tracks:
+                print("No subtitle tracks available")
+                continue
+            arg = cmd[2:].strip()
+            if arg == 'none':
+                rf.default_subtitle_lang = ""
+            else:
+                try:
+                    idx = int(arg) - 1
+                    if 0 <= idx < len(rf.subtitle_tracks):
+                        rf.default_subtitle_lang = rf.subtitle_tracks[idx].language
+                    else:
+                        print(f"Invalid track number. Enter 1-{len(rf.subtitle_tracks)} or 'none'")
+                except ValueError:
+                    print("Invalid input. Use 's <number>' or 's none'")
+        elif cmd == 'crop on':
+            if rf.detected_crop:
+                rf.enable_crop = True
+            else:
+                print("No crop detected. Use 'crop W:H:X:Y' to set manually.")
+        elif cmd == 'crop off':
+            rf.enable_crop = False
+        elif cmd.startswith('crop '):
+            crop_val = cmd[5:].strip()
+            is_valid, error = validate_crop(
+                crop_val,
+                rf.original_width,
+                rf.original_height
+            )
+            if is_valid:
+                rf.detected_crop = crop_val
+                rf.enable_crop = True
+            else:
+                print(error)
+        else:
+            print("Unknown command")
+
+
+def configure_per_file(files: list[ReencodeFile]) -> bool:
+    """
+    Per-file configuration mode.
+    Returns True to continue, False to quit.
+    """
+    processable = [f for f in files if not f.is_dv]
+    
+    if not processable:
+        return True
+    
+    # Apply default audio selection to all files first
+    for rf in processable:
+        apply_default_audio_selection(rf.audio_tracks)
+        # Set default_audio_lang to first selected track's language
+        selected = [t for t in rf.audio_tracks if t.selected]
+        if selected:
+            rf.default_audio_lang = selected[0].language
+    
+    print()
+    print("=" * 60)
+    print("Per-File Configuration Mode")
+    print("=" * 60)
+    print(f"Configuring {len(processable)} files individually.")
+    print("Use [n]ext/[p]rev to navigate, [d]one when finished.")
+    
+    idx = 0
+    while True:
+        rf = processable[idx]
+        result = configure_file_individually(rf, idx + 1, len(processable))
+        
+        if result is None:
+            return False
+        elif result == 'next':
+            if idx < len(processable) - 1:
+                idx += 1
+            else:
+                print("Already at last file. Use [d]one to finish.")
+        elif result == 'prev':
+            if idx > 0:
+                idx -= 1
+        elif result == 'done':
+            return True
+
+
+# =============================================================================
 # Phase 3: File Selection
 # =============================================================================
 
@@ -1270,56 +1591,63 @@ def display_files(files: list[ReencodeFile], source_dir: Path):
         ]
         print(f"        Now:   {' | '.join(now_parts)}")
         
-        # After line - what will happen
+        # After line - what will happen based on processing_mode
         if rf.is_dv:
             print(f"        After: [SKIP - Dolby Vision]")
-        elif rf.is_already_x265 and not rf.enable_crop:
-            print(f"        After: [SKIP - already hevc, no crop]")
         elif rf.skip_reason:
             print(f"        After: [SKIP - {rf.skip_reason}]")
         else:
-            after_res = rf.output_resolution_str
+            mode = rf.processing_mode
             after_audio = f"{len(rf.selected_audio_indices)} audio (FLAC)"
             
-            # Show what's changing
-            changes = []
-            
-            # Codec change (use hevc consistently)
-            if not rf.is_already_x265:
-                changes.append(f"{rf.codec}->hevc")
+            if mode == "skip":
+                print(f"        After: [SKIP - no changes needed]")
+            elif mode == "remux":
+                # Audio-only remux, video copied
+                print(f"        After: [REMUX] hevc (copy) | {rf.resolution_str} | {after_audio}")
             else:
-                changes.append("hevc")
-            
-            # Resolution change (only show arrow if actually changing)
-            if rf.enable_crop and rf.resolution_str != after_res:
-                changes.append(f"{rf.resolution_str}->{after_res}")
-            else:
-                changes.append(after_res)
-            
-            changes.append(after_audio)
-            
-            print(f"        After: {' | '.join(changes)}")
+                # Full re-encode
+                after_res = rf.output_resolution_str
+                changes = []
+                
+                # Codec change
+                if not rf.is_already_x265:
+                    changes.append(f"{rf.codec}->hevc")
+                else:
+                    changes.append("hevc")
+                
+                # Resolution change (only show arrow if actually changing)
+                if rf.enable_crop and rf.resolution_str != after_res:
+                    changes.append(f"{rf.resolution_str}->{after_res}")
+                else:
+                    changes.append(after_res)
+                
+                changes.append(after_audio)
+                
+                print(f"        After: [ENCODE] {' | '.join(changes)}")
     
     print()
     
     # Summary
-    selected = [f for f in files if f.selected]
-    to_encode = [f for f in selected if not f.is_dv and not f.skip_reason]
-    already_x265 = [f for f in to_encode if f.is_already_x265 and not f.enable_crop]
-    will_process = [f for f in to_encode if not (f.is_already_x265 and not f.enable_crop)]
-    with_crop = [f for f in will_process if f.enable_crop]
+    selected = [f for f in files if f.selected and not f.is_dv and not f.skip_reason]
+    will_encode = [f for f in selected if f.processing_mode == "reencode"]
+    will_remux = [f for f in selected if f.processing_mode == "remux"]
+    will_skip = [f for f in selected if f.processing_mode == "skip"]
+    with_crop = [f for f in will_encode if f.enable_crop]
     
     print(f"Archive location: {ARCHIVE_BASE}")
     print(f"Log file: {LOG_FILE}")
     print()
     print(f"Summary:")
     print(f"  Selected: {len(selected)}/{len(files)} files")
-    if already_x265:
-        print(f"  Already hevc (will re-encode): {len(already_x265)} files")
-    if will_process:
-        print(f"  Will encode: {len(will_process)} files ({sum(f.size_gb for f in will_process):.2f} GB)")
+    if will_encode:
+        print(f"  Will encode (video+audio): {len(will_encode)} files ({sum(f.size_gb for f in will_encode):.2f} GB)")
     if with_crop:
-        print(f"  With crop: {len(with_crop)} files")
+        print(f"    With crop: {len(with_crop)} files")
+    if will_remux:
+        print(f"  Will remux (audio only): {len(will_remux)} files")
+    if will_skip:
+        print(f"  Will skip (no changes): {len(will_skip)} files")
     print()
 
 
@@ -1395,7 +1723,7 @@ def interactive_selection(files: list[ReencodeFile], source_dir: Path) -> bool:
 def encode_file(
     source: Path,
     x265_params: list[str],
-    audio_indices: list[int],
+    audio_tracks: list[AudioTrack],
     default_audio_idx: int | None = 0,
     default_subtitle_idx: int | None = None,
     crop: str = ""
@@ -1409,10 +1737,10 @@ def encode_file(
         "-i", str(source),
         "-map", "0:v",
     ]
-    
-    for idx in audio_indices:
-        cmd.extend(["-map", f"0:{idx}"])
-    
+
+    for track in audio_tracks:
+        cmd.extend(["-map", f"0:{track.index}"])
+
     cmd.extend([
         "-map", "0:s?",
         "-map", "0:t?",
@@ -1420,11 +1748,11 @@ def encode_file(
         "-map_metadata", "0",
         "-map_chapters", "0",
     ])
-    
+
     # Add crop filter if specified
     if crop:
         cmd.extend(["-vf", f"crop={crop}"])
-    
+
     cmd.extend([
         "-c:v", "libx265",
         "-crf", "12",
@@ -1432,19 +1760,25 @@ def encode_file(
         "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
     ])
-    
+
     if x265_params:
         cmd.extend(["-x265-params", ":".join(x265_params)])
-    
+
+    # Set per-stream audio codec: copy FLAC, encode others to FLAC
+    for i, track in enumerate(audio_tracks):
+        if track.codec.upper() == "FLAC":
+            cmd.extend([f"-c:a:{i}", "copy"])
+        else:
+            cmd.extend([f"-c:a:{i}", "flac"])
+
     cmd.extend([
-        "-c:a", "flac",
         "-c:s", "copy",
         "-c:t", "copy",
         "-c:d", "copy",
     ])
-    
+
     # Set audio track dispositions
-    for i in range(len(audio_indices)):
+    for i in range(len(audio_tracks)):
         if i == default_audio_idx:
             cmd.extend([f"-disposition:a:{i}", "default"])
         else:
@@ -1496,33 +1830,143 @@ def encode_file(
         return False
 
 
+def remux_file(
+    source: Path,
+    audio_tracks: list[AudioTrack],
+    default_audio_idx: int | None = 0,
+    default_subtitle_idx: int | None = None
+) -> bool:
+    """
+    Remux file: copy video, convert audio to FLAC (or copy if already FLAC), copy subtitles.
+    Much faster than re-encoding when video doesn't need changes.
+    Returns True on success.
+    """
+    temp_output = source.with_suffix(".tmp.mkv")
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i", str(source),
+        "-map", "0:v",
+    ]
+
+    for track in audio_tracks:
+        cmd.extend(["-map", f"0:{track.index}"])
+
+    cmd.extend([
+        "-map", "0:s?",
+        "-map", "0:t?",
+        "-map", "0:d?",
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        "-c:v", "copy",      # Copy video stream unchanged
+    ])
+
+    # Set per-stream audio codec: copy FLAC, encode others to FLAC
+    for i, track in enumerate(audio_tracks):
+        if track.codec.upper() == "FLAC":
+            cmd.extend([f"-c:a:{i}", "copy"])
+        else:
+            cmd.extend([f"-c:a:{i}", "flac"])
+
+    cmd.extend([
+        "-c:s", "copy",
+        "-c:t", "copy",
+        "-c:d", "copy",
+    ])
+
+    # Set audio track dispositions
+    for i in range(len(audio_tracks)):
+        if i == default_audio_idx:
+            cmd.extend([f"-disposition:a:{i}", "default"])
+        else:
+            cmd.extend([f"-disposition:a:{i}", "0"])
+    
+    # Set subtitle track dispositions
+    if default_subtitle_idx is not None:
+        cmd.extend(["-disposition:s", "0"])
+        cmd.extend([f"-disposition:s:{default_subtitle_idx}", "default"])
+    else:
+        cmd.extend(["-disposition:s", "0"])
+    
+    cmd.extend([
+        "-y",
+        str(temp_output)
+    ])
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        output_lines = []
+        for line in process.stdout:
+            output_lines.append(line)
+            if "frame=" in line or "speed=" in line or "size=" in line:
+                print(f"\r  {line.strip()[:100]}", end="", flush=True)
+
+        process.wait()
+        print()
+
+        if process.returncode != 0:
+            log(f"FAILED: {source.name}")
+            error_output = "".join(output_lines[-30:])
+            log(f"  Error: {error_output}")
+            temp_output.unlink(missing_ok=True)
+            return False
+        return True
+
+    except Exception as e:
+        log(f"FAILED: {source.name} - {e}")
+        temp_output.unlink(missing_ok=True)
+        return False
+
+
 def process_file(rf: ReencodeFile) -> str:
     """
-    Encode, archive original, replace with new file.
+    Process file based on its processing_mode.
     Returns: 'success', 'skipped', or 'failed'
     """
     source = rf.path
     temp_output = source.with_suffix(".tmp.mkv")
     archive_path = get_archive_path(source)
+    
+    mode = rf.processing_mode
+    
+    if mode == "skip":
+        log(f"SKIPPED: {source.name} (no changes needed)")
+        return "skipped"
 
-    audio_indices = rf.selected_audio_indices
+    audio_tracks = rf.selected_audio_tracks
     default_audio_idx = rf.get_default_audio_index()
     default_subtitle_idx = rf.get_default_subtitle_index()
     crop = rf.detected_crop if rf.enable_crop else ""
-    
-    log(f"Processing: {source.name} (codec: {rf.codec}, {rf.hdr_status})")
-    log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_indices)} selected (default: {default_audio_idx})")
-    log(f"  Subtitles: {len(rf.subtitle_tracks)} tracks (default: {default_subtitle_idx})")
-    
-    if crop:
-        log(f"  Crop: {crop}")
-    
-    if rf.x265_params:
-        log(f"  HDR params: {':'.join(rf.x265_params)}")
 
-    # Encode
-    if not encode_file(source, rf.x265_params, audio_indices, default_audio_idx, default_subtitle_idx, crop):
-        return "failed"
+    if mode == "remux":
+        log(f"Remuxing: {source.name} (audio only, video copied)")
+        log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_tracks)} selected (default: {default_audio_idx})")
+        log(f"  Subtitles: {len(rf.subtitle_tracks)} tracks (default: {default_subtitle_idx})")
+
+        if not remux_file(source, audio_tracks, default_audio_idx, default_subtitle_idx):
+            return "failed"
+    else:
+        # Full re-encode
+        log(f"Encoding: {source.name} (codec: {rf.codec}, {rf.hdr_status})")
+        log(f"  Audio: {len(rf.audio_tracks)} tracks -> {len(audio_tracks)} selected (default: {default_audio_idx})")
+        log(f"  Subtitles: {len(rf.subtitle_tracks)} tracks (default: {default_subtitle_idx})")
+
+        if crop:
+            log(f"  Crop: {crop}")
+
+        if rf.x265_params:
+            log(f"  HDR params: {':'.join(rf.x265_params)}")
+
+        if not encode_file(source, rf.x265_params, audio_tracks, default_audio_idx, default_subtitle_idx, crop):
+            return "failed"
 
     # Create archive directory
     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1555,14 +1999,27 @@ def process_file(rf: ReencodeFile) -> str:
 
 def process_files(files: list[ReencodeFile], source_dir: Path):
     """Process all selected files."""
-    selected = [f for f in files if f.selected]
+    selected = [f for f in files if f.selected and not f.is_dv and not f.skip_reason]
     
-    total_size = sum(f.size_gb for f in selected)
+    # Categorize by processing mode
+    to_encode = [f for f in selected if f.processing_mode == "reencode"]
+    to_remux = [f for f in selected if f.processing_mode == "remux"]
+    to_skip = [f for f in selected if f.processing_mode == "skip"]
+    
+    if not to_encode and not to_remux:
+        print("No files need processing.")
+        return
     
     print()
     print("=" * 60)
-    print(f"Starting encode: {len(selected)} files ({total_size:.2f} GB)")
+    print("Ready to process")
     print("=" * 60)
+    if to_encode:
+        print(f"  Encode (video+audio): {len(to_encode)} files ({sum(f.size_gb for f in to_encode):.2f} GB)")
+    if to_remux:
+        print(f"  Remux (audio only):   {len(to_remux)} files")
+    if to_skip:
+        print(f"  Skip (no changes):    {len(to_skip)} files")
     print()
     
     confirm = input("Final confirmation - proceed? [y/N]: ").strip().lower()
@@ -1570,31 +2027,42 @@ def process_files(files: list[ReencodeFile], source_dir: Path):
         print("Aborted.")
         return
     
+    # Process only files that need it
+    to_process = to_encode + to_remux
+    
     log("=" * 60)
-    log(f"Starting batch encode: {len(selected)} files in {source_dir}")
+    log(f"Starting batch: {len(to_encode)} encode, {len(to_remux)} remux in {source_dir}")
     log("=" * 60)
 
     success = 0
     failed = 0
+    skipped = 0
 
-    for i, rf in enumerate(selected, 1):
+    for i, rf in enumerate(to_process, 1):
         try:
             rel_path = rf.path.relative_to(source_dir)
         except ValueError:
             rel_path = rf.path.name
-        log(f"[{i}/{len(selected)}] {rel_path}")
+        
+        mode_str = "ENCODE" if rf.processing_mode == "reencode" else "REMUX"
+        log(f"[{i}/{len(to_process)}] [{mode_str}] {rel_path}")
 
         result = process_file(rf)
         
         if result == "success":
             success += 1
+        elif result == "skipped":
+            skipped += 1
         else:
             failed += 1
 
     log("=" * 60)
     log(f"Complete:")
-    log(f"  Encoded: {success}")
-    log(f"  Failed:  {failed}")
+    log(f"  Success: {success}")
+    if skipped:
+        log(f"  Skipped: {skipped}")
+    if failed:
+        log(f"  Failed:  {failed}")
     log("=" * 60)
 
 
@@ -1639,20 +2107,35 @@ def main():
         print("No MKV files found")
         sys.exit(0)
 
+    # Track if we need per-file mode
+    use_perfile_mode = False
+
     # Phase 1b: Crop configuration (if crop detected)
-    if not configure_crop(files):
+    crop_result = configure_crop(files)
+    if crop_result is False:
         print("Cancelled.")
         sys.exit(0)
+    elif crop_result == "perfile":
+        use_perfile_mode = True
 
-    # Phase 2: Audio configuration
-    if not configure_audio(files):
-        print("Cancelled.")
-        sys.exit(0)
+    # Phase 2: Audio configuration (skip if going to per-file mode)
+    if not use_perfile_mode:
+        audio_result = configure_audio(files)
+        if audio_result is False:
+            print("Cancelled.")
+            sys.exit(0)
+        elif audio_result == "perfile":
+            use_perfile_mode = True
 
-    # Phase 2b: Default track configuration
-    if not configure_defaults(files):
-        print("Cancelled.")
-        sys.exit(0)
+    # Phase 2b/2c: Default track configuration OR per-file mode
+    if use_perfile_mode:
+        if not configure_per_file(files):
+            print("Cancelled.")
+            sys.exit(0)
+    else:
+        if not configure_defaults(files):
+            print("Cancelled.")
+            sys.exit(0)
 
     # Phase 3: File selection
     if not interactive_selection(files, source_dir):
