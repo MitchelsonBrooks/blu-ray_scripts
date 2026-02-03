@@ -2,7 +2,7 @@
 """
 Interactive batch MKV re-encoder for fixing timestamp issues.
 
-Encodes video to x265 CRF 12 (10-bit) and audio to FLAC.
+Encodes video to x265 CRF 10 (10-bit) and audio to FLAC.
 Preserves HDR metadata. Skips Dolby Vision content.
 Configurable audio track selection with lossless preference.
 Archives originals before replacing.
@@ -2036,7 +2036,7 @@ def encode_file(
 
     cmd.extend([
         "-c:v", "libx265",
-        "-crf", "12",
+        "-crf", "10",
         "-preset", "slow",
         "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
