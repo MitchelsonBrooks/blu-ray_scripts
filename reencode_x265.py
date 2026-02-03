@@ -2,14 +2,15 @@
 """
 Interactive batch MKV re-encoder for fixing timestamp issues.
 
-Encodes video to x265 CRF 10 (10-bit) and audio to FLAC.
-Preserves HDR metadata. Skips Dolby Vision content.
+Encodes video to x265 CRF 10 (10-bit, or 12-bit for 12-bit sources) and audio to FLAC.
+Preserves HDR metadata and bit depth. Skips Dolby Vision content.
 Configurable audio track selection with lossless preference.
 Archives originals before replacing.
 
 Usage:
-    python3 reencode_x265.py /tank/media/anime/Show/
-    python3 reencode_x265.py -t /tank/media/anime/Show/
+    python3 reencode_x265.py /path/to/media/Show/
+    python3 reencode_x265.py -t /path/to/media/Show/
+    python3 reencode_x265.py /path/to/media/movies/movie.mkv
 
 Options:
     -t, --timestamps    Analyze files for timestamp issues (slower but thorough).
@@ -26,10 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 
-# Configuration
-MEDIA_BASE = Path("/tank/media")
-ARCHIVE_BASE = Path("/tank/archive/originals")
-LOG_FILE = Path("/tank/archive/reencode.log")
+# Configuration (set in main() from CLI args)
+MEDIA_BASE = None
+ARCHIVE_BASE = None
+LOG_FILE = None
+LOCAL_TEMP = None
 
 # Audio codec classification
 LOSSLESS_AUDIO = {
@@ -155,6 +157,7 @@ class ReencodeFile:
     duration_seconds: float = 0.0
     detected_crop: str = ""           # Detected crop string (e.g., "1920:800:0:140")
     enable_crop: bool = False         # Whether to apply crop during encode
+    bit_depth: int = 10               # Source video bit depth (8, 10, 12, etc.)
     selected: bool = True
     skip_reason: str = ""
     default_audio_lang: str = ""      # Language code for default audio
@@ -360,7 +363,7 @@ def probe_video(source: Path) -> dict:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,width,height,color_transfer,color_primaries,color_space,pix_fmt",
+        "-show_entries", "stream=codec_name,width,height,color_transfer,color_primaries,color_space,pix_fmt,bits_per_raw_sample",
         "-show_entries", "stream_side_data",
         "-of", "json",
         str(source)
@@ -699,7 +702,7 @@ def detect_crop(source: Path, duration: float, num_samples: int = 32) -> str:
             "ffmpeg",
             "-ss", str(seek_time),
             "-i", str(source),
-            "-vf", "cropdetect=round=2:limit=24",
+            "-vf", "scale=in_range=limited:out_range=full,cropdetect=round=2:limit=24",
             "-frames:v", "3",
             "-f", "null",
             "-"
@@ -885,9 +888,9 @@ def get_hdr_params(source: Path) -> tuple[list[str], bool]:
 # Phase 1: Scanning
 # =============================================================================
 
-def scan_files(source_dir: Path, check_timestamps: bool = False) -> list[ReencodeFile]:
+def scan_files(source_dir: Path, check_timestamps: bool = False, single_file: Path = None) -> list[ReencodeFile]:
     """Scan all MKV files and analyze them."""
-    mkv_paths = sorted(source_dir.glob("**/*.mkv"))
+    mkv_paths = [single_file] if single_file else sorted(source_dir.glob("**/*.mkv"))
 
     if not mkv_paths:
         return []
@@ -908,6 +911,7 @@ def scan_files(source_dir: Path, check_timestamps: bool = False) -> list[Reencod
         codec = stream.get("codec_name", "unknown")
         orig_width = stream.get("width", 0)
         orig_height = stream.get("height", 0)
+        bit_depth = int(stream.get("bits_per_raw_sample") or 8)
 
         # Check DV first
         dv = is_dolby_vision(mkv_path)
@@ -949,6 +953,7 @@ def scan_files(source_dir: Path, check_timestamps: bool = False) -> list[Reencod
             original_height=orig_height,
             duration_seconds=duration,
             detected_crop=detected_crop,
+            bit_depth=bit_depth,
             selected=not dv,  # Auto-deselect DV files
             skip_reason="Dolby Vision" if dv else "",
             timestamp_issues=timestamp_issues
@@ -2007,10 +2012,11 @@ def encode_file(
     audio_tracks: list[AudioTrack],
     default_audio_idx: int | None = 0,
     default_subtitle_idx: int | None = None,
-    crop: str = ""
+    crop: str = "",
+    bit_depth: int = 10
 ) -> bool:
     """Encode a single file. Returns True on success."""
-    temp_output = source.with_suffix(".tmp.mkv")
+    temp_output = LOCAL_TEMP / (source.stem + ".tmp.mkv")
 
     cmd = [
         "ffmpeg",
@@ -2034,12 +2040,20 @@ def encode_file(
     if crop:
         cmd.extend(["-vf", f"crop={crop}"])
 
+    # Use 12-bit encoding for 12-bit+ sources, otherwise 10-bit
+    if bit_depth >= 12:
+        profile = "main12"
+        pix_fmt = "yuv420p12le"
+    else:
+        profile = "main10"
+        pix_fmt = "yuv420p10le"
+
     cmd.extend([
         "-c:v", "libx265",
         "-crf", "10",
         "-preset", "slow",
-        "-profile:v", "main10",
-        "-pix_fmt", "yuv420p10le",
+        "-profile:v", profile,
+        "-pix_fmt", pix_fmt,
     ])
 
     if x265_params:
@@ -2122,7 +2136,7 @@ def remux_file(
     Much faster than re-encoding when video doesn't need changes.
     Returns True on success.
     """
-    temp_output = source.with_suffix(".tmp.mkv")
+    temp_output = LOCAL_TEMP / (source.stem + ".tmp.mkv")
 
     cmd = [
         "ffmpeg",
@@ -2213,11 +2227,11 @@ def process_file(rf: ReencodeFile) -> str:
     Returns: 'success', 'skipped', or 'failed'
     """
     source = rf.path
-    temp_output = source.with_suffix(".tmp.mkv")
+    temp_output = LOCAL_TEMP / (source.stem + ".tmp.mkv")
     archive_path = get_archive_path(source)
-    
+
     mode = rf.processing_mode
-    
+
     if mode == "skip":
         log(f"SKIPPED: {source.name} (no changes needed)")
         return "skipped"
@@ -2246,7 +2260,10 @@ def process_file(rf: ReencodeFile) -> str:
         if rf.x265_params:
             log(f"  HDR params: {':'.join(rf.x265_params)}")
 
-        if not encode_file(source, rf.x265_params, audio_tracks, default_audio_idx, default_subtitle_idx, crop):
+        if rf.bit_depth >= 12:
+            log(f"  Bit depth: {rf.bit_depth}-bit source -> 12-bit encode")
+
+        if not encode_file(source, rf.x265_params, audio_tracks, default_audio_idx, default_subtitle_idx, crop, rf.bit_depth):
             return "failed"
 
     # Create archive directory
@@ -2260,12 +2277,17 @@ def process_file(rf: ReencodeFile) -> str:
         temp_output.unlink(missing_ok=True)
         return "failed"
 
-    # Rename temp to original name
+    # Copy temp to original name (cross-filesystem safe)
     try:
-        temp_output.rename(source)
+        shutil.copy2(str(temp_output), str(source))
+        temp_output.unlink()
     except Exception as e:
-        log(f"FAILED to rename: {source.name} - {e}")
-        shutil.move(str(archive_path), str(source))
+        log(f"FAILED to copy temp to destination: {source.name} - {e}")
+        # Restore original from archive
+        try:
+            shutil.move(str(archive_path), str(source))
+        except Exception as restore_err:
+            log(f"FAILED to restore original from archive: {restore_err}")
         temp_output.unlink(missing_ok=True)
         return "failed"
 
@@ -2370,16 +2392,17 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    %(prog)s /tank/media/anime/Show/
-    %(prog)s --timestamps /tank/media/anime/Show/
-    %(prog)s -t /tank/media/movies/
+    %(prog)s /path/to/media/Show/
+    %(prog)s --timestamps /path/to/media/Show/
+    %(prog)s -t /path/to/movies/
+    %(prog)s /path/to/movies/movie.mkv
         """
     )
 
     parser.add_argument(
-        "directory",
+        "path",
         type=Path,
-        help="Directory containing MKV files to process"
+        help="Directory containing MKV files or a single MKV file to process"
     )
 
     parser.add_argument(
@@ -2388,30 +2411,72 @@ Examples:
         help="Analyze files for timestamp issues (slower but thorough)"
     )
 
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        default=Path("~/reencode-archive/originals"),
+        help="Where to store original files before replacement (default: ~/reencode-archive/originals)"
+    )
+
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=Path("~/reencode-archive/reencode.log"),
+        help="Log file path (default: ~/reencode-archive/reencode.log)"
+    )
+
+    parser.add_argument(
+        "--temp-dir",
+        type=Path,
+        default=Path("tmp"),
+        help="Local temp directory for ffmpeg output (default: ./tmp)"
+    )
+
     return parser.parse_args()
 
 
 def main():
+    global MEDIA_BASE, ARCHIVE_BASE, LOG_FILE, LOCAL_TEMP
+
     check_dependencies()
     args = parse_args()
 
-    source_dir = args.directory.expanduser().resolve()
+    source_path = args.path.expanduser().resolve()
 
-    if not source_dir.exists():
-        print(f"Error: Directory does not exist: {source_dir}")
+    if not source_path.exists():
+        print(f"Error: Path does not exist: {source_path}")
         sys.exit(1)
 
-    if not source_dir.is_dir():
-        print(f"Error: {source_dir} is not a directory")
+    if source_path.is_file():
+        if source_path.suffix.lower() != ".mkv":
+            print(f"Error: {source_path} is not an MKV file")
+            sys.exit(1)
+        source_dir = source_path.parent
+        single_file = source_path
+        print(f"File: {source_path}")
+    elif source_path.is_dir():
+        source_dir = source_path
+        single_file = None
+        print(f"Directory: {source_dir}")
+    else:
+        print(f"Error: {source_path} is not a file or directory")
         sys.exit(1)
 
-    print(f"Directory: {source_dir}")
+    # Set configuration from CLI args
+    MEDIA_BASE = source_dir
+    ARCHIVE_BASE = args.archive_dir.expanduser().resolve()
+    LOG_FILE = args.log_file.expanduser().resolve()
+    LOCAL_TEMP = args.temp_dir
+
     if args.timestamps:
         print("Timestamp analysis: enabled")
     print()
 
     # Phase 1: Scan
-    files = scan_files(source_dir, check_timestamps=args.timestamps)
+    if single_file:
+        files = scan_files(source_dir, check_timestamps=args.timestamps, single_file=single_file)
+    else:
+        files = scan_files(source_dir, check_timestamps=args.timestamps)
     
     if not files:
         print("No MKV files found")
@@ -2453,6 +2518,7 @@ def main():
         sys.exit(0)
 
     # Phase 4: Process
+    LOCAL_TEMP.mkdir(parents=True, exist_ok=True)
     process_files(files, source_dir)
 
 
